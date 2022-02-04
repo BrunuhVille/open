@@ -678,10 +678,10 @@ Install_Main(){
 	MEM_TOTAL=$(free -g|grep Mem|awk '{print $2}')
 
 	
-	if [ "${PM}" = "yum" ]; 
+	if [[ "${PM}" = "yum" ]]; 
 	then
 		Install_RPM_Pack
-	elif [ "${PM}" = "apt-get" ]; 
+	elif [[ "${PM}" = "apt-get" ]]; 
 	then
 		Install_Deb_Pack
 	fi
