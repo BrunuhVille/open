@@ -46,10 +46,10 @@ Install_RealM(){
   [[ -z ${version} ]] && version="1"
   if [[ ${version} == [2] ]]; then  
   mkdir /etc/realm
-  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm && chmod 777 realm && mv realm /etc/realm/realm
   else
   mkdir /etc/realm
-  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm && chmod 777 realm && mv realm /etc/realm/realm
   fi  
   else
   echo -e "#############################################################"
@@ -60,10 +60,10 @@ Install_RealM(){
   [[ -z ${version} ]] && version="1"
   if [[ ${version} == [2] ]]; then  
   mkdir /etc/realm
-  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm && chmod 777 realm && mv realm /etc/realm/realm
   else
   mkdir /etc/realm
-  wget -N --no-check-certificate http://146.56.133.33:13333/realm1.5 && chmod 777 realm1.5 && mv realm1.5 /etc/realm/realm
+  wget -N --no-check-certificate http://146.56.133.33:13333/realm && chmod 777 realm && mv realm /etc/realm/realm
   fi
   fi
   
