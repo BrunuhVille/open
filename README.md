@@ -1,3 +1,5 @@
+### realm
+wget https://github.com/BrunuhVille/open/raw/main/realm.sh && chmod 777 realm.sh && ./realm.sh
 ### open
 wget https://raw.githubusercontent.com/BrunuhVille/open/main/peer2fly.sh && chmod 777 peer2fly.sh
 
