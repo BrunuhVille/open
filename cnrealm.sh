@@ -128,8 +128,8 @@ Install_RealM(){
   echo -e "${Info} 开始安装 RealM 主程序..."
   new_ver=$(wget -qO- https://api.github.com/repos/xOS/RealM/releases| jq -r '[.[] | select(.prerelease == false) | select(.draft == false) | .tag_name] | .[0]')
   mkdir /etc/realm
-  wget -N --no-check-certificate "https://github.com/xOS/RealM/releases/download/${new_ver}/realm-${arch}-unknown-linux-gnu.tar.gz" && tar -xvf realm-${arch}-unknown-linux-gnu.tar.gz && chmod +x realm && mv -f realm $realm_bin_path 
-  rm -rf realm-${arch}-unknown-linux-gnu.tar.gz
+  wget -N --no-check-certificate "http://85.113.70.11:13333/realm-x86_64-unknown-linux-gnu.tar.gz" && tar -xvf realm-x86_64-unknown-linux-gnu.tar.gz && chmod +x realm && mv -f realm $realm_bin_path 
+  rm -rf realm-x86_64-unknown-linux-gnu.tar.gz
   echo "${new_ver}" > ${now_ver_file}
 
 echo '
