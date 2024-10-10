@@ -69,7 +69,7 @@ async def schedule_transaction():
     return True
 
 
-scheduler.add_job(schedule_transaction, "cron", hour="*", minute="*/2", second="0")
+scheduler.add_job(schedule_transaction, "cron", hour="*", minute="*", second="*/3")
 
 if __name__ == "__main__":
     from asyncio import run
