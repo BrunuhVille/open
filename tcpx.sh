@@ -1,54 +1,39 @@
 #!/usr/bin/env bash
 
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+# 命令搜索路径必须是固定的 root 目录集合：不要追加 ~/bin，
+# 因为 ~ 由调用方的 HOME 展开，sudo 保留 HOME 时本地用户可借此投毒 root 执行的命令。
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
 export PATH
 
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.6.11"
-
-# GitHub 全链路加速配置 (覆盖 raw / api / releases / 子脚本内部链接)
-# 默认启用国内加速镜像并自动并发测速择优；可通过环境变量自定义：
-#   GH_PROXY="https://xxx/"  指定首选加速前缀
-#   GH_DIRECT=1              强制直连 GitHub (仅海外无需代理时使用)
-GH_PROXY="${GH_PROXY:-https://gh-proxy.org/}"
-[[ -n "$GH_PROXY" && "$GH_PROXY" != */ ]] && GH_PROXY="${GH_PROXY}/"
-
-# 支持 api.github.com + raw + releases 全功能的镜像池
-readonly GH_API_MIRRORS=(
-	"https://gh-proxy.org/"
-	"https://cdn.gh-proxy.org/"
-	"https://edgeone.gh-proxy.org/"
-	"https://hk.gh-proxy.org/"
-	"https://gh-proxy.com/"
-)
-
-# 支持 raw + releases + 源码包下载的完整加速镜像池
-readonly GH_DL_MIRRORS=(
-	"https://gh-proxy.org/"
-	"https://cdn.gh-proxy.org/"
-	"https://edgeone.gh-proxy.org/"
-	"https://hk.gh-proxy.org/"
-	"https://gh-proxy.com/"
-	"https://ghfast.top/"
-	"https://githubproxy.cc/"
-	"https://fastgit.cc/"
-)
-
-readonly GITHUB_RAW_URL="${GH_PROXY}https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
-readonly GITHUB_API_BASE="${GH_PROXY}https://api.github.com"
+readonly SH_VER="100.0.6.16"
+readonly SH_CN_MOD="CN全链路加速版 v2.0"
+readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 # 内核二进制 (bbr/bbrplus/lotserver) 已从仓库迁移到 Release，按目录整包托管，避免仓库臃肿。
-readonly KERNEL_RELEASE_BASE="${GH_PROXY}https://github.com/ylx2016/Linux-NetSpeed/releases/download/kernels"
-readonly CLOUD_STATE_FILE="/etc/tcpx_cloud_lastver"                        # installcloud 记忆上次探测到的最高可安装 Cloud 内核
-readonly CLOUD_HDR_POOL="https://deb.debian.org/debian/pool/main/l/linux/" # Cloud 内核 headers (arch/-common/kbuild) 所在 pool
+readonly KERNEL_RELEASE_BASE="https://github.com/ylx2016/Linux-NetSpeed/releases/download/kernels"
+readonly CLOUD_STATE_FILE="/etc/tcpx_cloud_lastver" # installcloud 记忆上次探测到的最高可安装 Cloud 内核
+readonly ACCEL_CONF_FILE="/etc/tcpx_accel.conf"     # 加速镜像/代理持久化配置文件
+# Cloud 内核 headers (arch/-common/kbuild) 所在 pool；国内环境会自动切换至清华/中科大/阿里云等国内镜像
+CLOUD_HDR_POOL="https://deb.debian.org/debian/pool/main/l/linux/"
 
 # 自安装：把脚本落地到 /usr/local/bin/tcpx，安装后可直接输入 tcpx 运行。
 # 以 bash <(curl -fsSL <URL>) 这类管道方式运行时本地没有文件副本，只能从下面的地址重新下载。
-# 默认使用与 Update_Shell 相同的权威地址；也可用环境变量 TCPX_URL 临时覆盖：
+# 默认走内置 GitHub 加速引擎拉取；也可用环境变量 TCPX_URL 覆盖为自建镜像地址：
 #   TCPX_URL=<地址> bash <(curl -fsSL <地址>)
 readonly TCPX_URL_DEFAULT="${GITHUB_RAW_URL}/tcpx.sh"
-readonly TCPX_SELF_URL="${TCPX_URL:-$TCPX_URL_DEFAULT}"
+# 允许任意合法 HTTPS 地址（兼容自建反代/国内加速镜像）；下载后仍强制经 fetch_remote_script 校验。
+resolve_self_url() {
+	local url="${1:-}"
+	if [[ -n "$url" && "$url" =~ ^https://[^[:space:]]+$ ]]; then
+		printf '%s\n' "$url"
+		return 0
+	fi
+	[[ -n "$url" ]] && echo -e "已忽略不受支持的 TCPX_URL (仅允许 https 地址)，改用默认地址。" >&2
+	printf '%s\n' "$TCPX_URL_DEFAULT"
+}
+readonly TCPX_SELF_URL="$(resolve_self_url "${TCPX_URL:-}")"
 readonly TCPX_INSTALL_PATH="/usr/local/bin/tcpx"
 
 # 颜色变量定义
@@ -115,7 +100,7 @@ check_sys() {
 
 	echo -e "${INFO} 检测到系统: ${OS_TYPE} (${OS_ID} ${OS_VERSION_ID}) - 架构: ${OS_ARCH}"
 
-	# 4. 精简依赖检查 (抛弃笨重的 lsb_release；API 的 JSON 解析已改用 grep，不再依赖 jq)
+	# 4. 精简依赖检查 (不强制 jq/EPEL；有 jq 才启用发布摘要解析，无 jq 仅允许上游直连)
 	local required_cmds=("curl" "wget" "awk")
 
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
@@ -248,289 +233,1097 @@ pre_install_check() {
 }
 
 # =================================================
-#  网络通信与下载模块
+#  全链路加速、网络通信与下载模块 (CN 深度优化版)
 # =================================================
 
-# 全局变量：是否启用 GitHub 加速镜像 (默认开启=1，除非用户通过 GH_DIRECT=1 强制直连)
-IS_CN=1
+# 全局变量：节点网络归属。
+#   0 = 海外 (直连优先，若配置了自定义镜像则优先自定义)
+#   1 = 中国大陆 (并行测速后，多类镜像全链路加速 + 直连兜底)
+#   2 = 归属地无法判定 (默认按国内加速处理，末尾保留直连兜底)
+IS_CN=0
 
-# 全局最优镜像变量 (下载镜像 / API 镜像)
+# 各类资源当前最优镜像缓存
 BEST_MIRROR=""
+BEST_MIRROR_FULL_URL=1
 BEST_API_MIRROR=""
+BEST_API_MIRROR_FULL_URL=1
+BEST_DEBIAN_MIRROR=""
+BEST_ELREPO_MIRROR=""
+_ACCEL_CONFIG_LOADED=0
 
-# 剥离 URL 已带的加速镜像前缀，还原出纯净的原始 GitHub 地址，防止二次套壳并支持无缝切换备用节点
-strip_github_mirror() {
-	local url="$1"
-	if [[ "$url" =~ ^https?://[^/]+/(https?://(www\.)?(github\.com|api\.github\.com|raw\.githubusercontent\.com|gist\.githubusercontent\.com|objects\.githubusercontent\.com|codeload\.github\.com|release-assets\.githubusercontent\.com)(/.*)?)$ ]]; then
-		echo "${BASH_REMATCH[1]}"
-		return 0
-	fi
-	if [[ "$url" =~ ^https?://[^/]+/((www\.)?(github\.com|api\.github\.com|raw\.githubusercontent\.com|gist\.githubusercontent\.com|objects\.githubusercontent\.com|codeload\.github\.com|release-assets\.githubusercontent\.com)(/.*)?)$ ]]; then
-		echo "https://${BASH_REMATCH[1]}"
-		return 0
-	fi
-	echo "$url"
+# 记录每个镜像实测偏好的拼接方式: 1=前缀+完整URL(https://...), 0=前缀+去协议头
+declare -A MIRROR_URL_MODE=()
+
+# 记录调用方是否通过环境变量显式指定了开关型配置（用于覆盖配置文件）
+_ENV_FORCE_CN_SET=0
+[[ -n "${TCPX_FORCE_CN:-}" ]] && _ENV_FORCE_CN_SET=1
+_ENV_STRICT_SET=0
+[[ -n "${TCPX_STRICT_DIGEST:-}" ]] && _ENV_STRICT_SET=1
+
+# 用户可配置加速参数（支持 /etc/tcpx_accel.conf 持久化及环境变量覆盖）
+TCPX_FORCE_CN="${TCPX_FORCE_CN:-auto}"
+TCPX_MIRROR="${TCPX_MIRROR:-${GH_PROXY:-}}"
+TCPX_API_MIRROR="${TCPX_API_MIRROR:-}"
+TCPX_RAW_MIRROR="${TCPX_RAW_MIRROR:-}"
+TCPX_UNIVERSAL_PROXY="${TCPX_UNIVERSAL_PROXY:-}"
+TCPX_HTTP_PROXY="${TCPX_HTTP_PROXY:-}"
+TCPX_DEBIAN_MIRROR="${TCPX_DEBIAN_MIRROR:-}"
+TCPX_ELREPO_MIRROR="${TCPX_ELREPO_MIRROR:-}"
+TCPX_STRICT_DIGEST="${TCPX_STRICT_DIGEST:-0}"
+TCPX_GITHUB_TOKEN="${TCPX_GITHUB_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
+TCPX_UPDATE_URL="${TCPX_UPDATE_URL:-}"
+
+# --- 实测验证的多类加速镜像池 ---
+# 1) GitHub 文件/Raw/Release 加速池 (全部经过真实内容校验，兼顾 EdgeOne/CDN/IPv6/多线路)
+GH_FILE_MIRRORS=(
+	"https://edgeone.gh-proxy.org/"
+	"https://cdn.gh-proxy.org/"
+	"https://gh-proxy.com/"
+	"https://gh-proxy.org/"
+	"https://v6.gh-proxy.org/"
+	"https://ghfast.top/"
+	"https://ghproxy.net/"
+	"https://githubproxy.cc/"
+	"https://wget.la/"
+	"https://gh.nxnow.top/"
+	"https://fastgit.cc/"
+)
+
+# 2) GitHub REST API (api.github.com) 专用加速池 (仅保留实测可返回真实 JSON 的节点)
+GH_API_MIRRORS=(
+	"https://edgeone.gh-proxy.org/"
+	"https://cdn.gh-proxy.org/"
+	"https://gh-proxy.com/"
+	"https://gh-proxy.org/"
+	"https://v6.gh-proxy.org/"
+	"https://wget.la/"
+	"https://gh.nxnow.top/"
+)
+
+# 3) jsDelivr Raw CDN 二级兜底池 (仅用于 raw.githubusercontent.com / github.com/.../raw/ 文件)
+JSDELIVR_MIRRORS=(
+	"https://fastly.jsdelivr.net"
+	"https://gcore.jsdelivr.net"
+	"https://testingcf.jsdelivr.net"
+)
+
+# 4) 国内 Debian 官方镜像池 (用于 Cloud 内核池、Headers 池、Backports 源)
+CN_DEBIAN_MIRRORS=(
+	"https://mirrors.tuna.tsinghua.edu.cn/debian"
+	"https://mirrors.ustc.edu.cn/debian"
+	"https://mirrors.aliyun.com/debian"
+	"https://mirrors.cloud.tencent.com/debian"
+	"https://mirrors.huaweicloud.com/debian"
+)
+
+# 5) 国内 ELRepo 官方镜像池 (用于 CentOS/Alma/Rocky kernel-ml 内核)
+CN_ELREPO_MIRRORS=(
+	"https://mirrors.tuna.tsinghua.edu.cn/elrepo"
+	"https://mirrors.aliyun.com/elrepo"
+	"https://mirrors.ustc.edu.cn/elrepo"
+)
+
+# 归属地检测端点：优先国内可秒回的端点，避免在海外端点上白白挂满超时
+CN_STATUS_ENDPOINTS=(
+	"cn|https://myip.ipip.net"
+	"cf|http://www.qualcomm.cn/cdn-cgi/trace"
+	"cf|https://cloudflare.com/cdn-cgi/trace"
+	"code|https://ipinfo.io/country"
+)
+CN_STATUS_TIMEOUT=2
+
+# 规范化镜像前缀（确保非空时以 / 结尾）
+normalize_mirror_prefix() {
+	local p="${1:-}"
+	p="${p#"${p%%[![:space:]]*}"}"
+	p="${p%"${p##*[![:space:]]}"}"
+	[[ -z "$p" ]] && return 0
+	[[ "$p" != */ ]] && p="${p}/"
+	printf '%s' "$p"
 }
 
-# 判断 URL 是否为 GitHub 系资源 (含 github.com / api / raw / gist / objects / codeload / release-assets)
-# 非 GitHub 域名 (如 deb.debian.org / snapshot.debian.org) 套镜像前缀必然 404，必须先行识别。
+# 去除末尾斜杠（用于 Debian/ELRepo 基础 URL）
+strip_trailing_slash() {
+	local u="${1:-}"
+	u="${u#"${u%%[![:space:]]*}"}"
+	u="${u%"${u##*[![:space:]]}"}"
+	while [[ "$u" == */ ]]; do
+		u="${u%/}"
+	done
+	printf '%s' "$u"
+}
+
+# 安全读取持久化加速配置（仅启动时加载一次；不 source 任意代码；调用方环境变量优先级更高）
+load_accel_config() {
+	if [[ "${_ACCEL_CONFIG_LOADED:-0}" == "1" ]]; then
+		apply_http_proxy_env
+		return 0
+	fi
+	_ACCEL_CONFIG_LOADED=1
+
+	local env_mirror="${TCPX_MIRROR:-}"
+	local env_api_mirror="${TCPX_API_MIRROR:-}"
+	local env_raw_mirror="${TCPX_RAW_MIRROR:-}"
+	local env_uproxy="${TCPX_UNIVERSAL_PROXY:-}"
+	local env_hproxy="${TCPX_HTTP_PROXY:-}"
+	local env_deb_mirror="${TCPX_DEBIAN_MIRROR:-}"
+	local env_elrepo_mirror="${TCPX_ELREPO_MIRROR:-}"
+	local env_token="${TCPX_GITHUB_TOKEN:-}"
+	local env_update_url="${TCPX_UPDATE_URL:-}"
+
+	if [[ -f "$ACCEL_CONF_FILE" && ! -L "$ACCEL_CONF_FILE" ]]; then
+		local owner
+		owner=$(stat -c '%u' "$ACCEL_CONF_FILE" 2>/dev/null || echo "")
+		if [[ "$owner" == "0" ]]; then
+			local line key val
+			while IFS= read -r line || [[ -n "$line" ]]; do
+				line="${line//$'\r'/}"
+				[[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+				[[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]] || continue
+				key="${BASH_REMATCH[1]}"
+				val="${BASH_REMATCH[2]}"
+				if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+					val="${BASH_REMATCH[1]}"
+				elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+					val="${BASH_REMATCH[1]}"
+				fi
+				case "$key" in
+				TCPX_FORCE_CN) [[ $_ENV_FORCE_CN_SET -eq 0 ]] && TCPX_FORCE_CN="$val" ;;
+				TCPX_MIRROR) [[ -z "$env_mirror" ]] && TCPX_MIRROR="$val" ;;
+				TCPX_API_MIRROR) [[ -z "$env_api_mirror" ]] && TCPX_API_MIRROR="$val" ;;
+				TCPX_RAW_MIRROR) [[ -z "$env_raw_mirror" ]] && TCPX_RAW_MIRROR="$val" ;;
+				TCPX_UNIVERSAL_PROXY) [[ -z "$env_uproxy" ]] && TCPX_UNIVERSAL_PROXY="$val" ;;
+				TCPX_HTTP_PROXY) [[ -z "$env_hproxy" ]] && TCPX_HTTP_PROXY="$val" ;;
+				TCPX_DEBIAN_MIRROR) [[ -z "$env_deb_mirror" ]] && TCPX_DEBIAN_MIRROR="$val" ;;
+				TCPX_ELREPO_MIRROR) [[ -z "$env_elrepo_mirror" ]] && TCPX_ELREPO_MIRROR="$val" ;;
+				TCPX_STRICT_DIGEST) [[ $_ENV_STRICT_SET -eq 0 ]] && TCPX_STRICT_DIGEST="$val" ;;
+				TCPX_GITHUB_TOKEN) [[ -z "$env_token" ]] && TCPX_GITHUB_TOKEN="$val" ;;
+				TCPX_UPDATE_URL) [[ -z "$env_update_url" ]] && TCPX_UPDATE_URL="$val" ;;
+				esac
+			done <"$ACCEL_CONF_FILE"
+		fi
+	fi
+
+	# 规范化 URL 格式
+	TCPX_MIRROR=$(normalize_mirror_prefix "$TCPX_MIRROR")
+	TCPX_API_MIRROR=$(normalize_mirror_prefix "$TCPX_API_MIRROR")
+	TCPX_RAW_MIRROR=$(normalize_mirror_prefix "$TCPX_RAW_MIRROR")
+	TCPX_UNIVERSAL_PROXY=$(normalize_mirror_prefix "$TCPX_UNIVERSAL_PROXY")
+	TCPX_DEBIAN_MIRROR=$(strip_trailing_slash "$TCPX_DEBIAN_MIRROR")
+	TCPX_ELREPO_MIRROR=$(strip_trailing_slash "$TCPX_ELREPO_MIRROR")
+
+	apply_http_proxy_env
+}
+
+# 将加速配置持久化写入 /etc/tcpx_accel.conf (权限 600，保护可选 Token)
+save_accel_config() {
+	local tmp_cfg
+	tmp_cfg=$(mktemp /tmp/tcpx_accel_cfg.XXXXXX) || return 1
+	chmod 600 "$tmp_cfg"
+	{
+		echo "# tcpx.sh 全链路加速配置文件 (由菜单 [70] 管理)"
+		printf 'TCPX_FORCE_CN="%s"\n' "${TCPX_FORCE_CN//\"/}"
+		printf 'TCPX_MIRROR="%s"\n' "${TCPX_MIRROR//\"/}"
+		printf 'TCPX_API_MIRROR="%s"\n' "${TCPX_API_MIRROR//\"/}"
+		printf 'TCPX_RAW_MIRROR="%s"\n' "${TCPX_RAW_MIRROR//\"/}"
+		printf 'TCPX_UNIVERSAL_PROXY="%s"\n' "${TCPX_UNIVERSAL_PROXY//\"/}"
+		printf 'TCPX_HTTP_PROXY="%s"\n' "${TCPX_HTTP_PROXY//\"/}"
+		printf 'TCPX_DEBIAN_MIRROR="%s"\n' "${TCPX_DEBIAN_MIRROR//\"/}"
+		printf 'TCPX_ELREPO_MIRROR="%s"\n' "${TCPX_ELREPO_MIRROR//\"/}"
+		printf 'TCPX_STRICT_DIGEST="%s"\n' "${TCPX_STRICT_DIGEST//\"/}"
+		printf 'TCPX_GITHUB_TOKEN="%s"\n' "${TCPX_GITHUB_TOKEN//\"/}"
+		printf 'TCPX_UPDATE_URL="%s"\n' "${TCPX_UPDATE_URL//\"/}"
+	} >"$tmp_cfg"
+	mv -f "$tmp_cfg" "$ACCEL_CONF_FILE"
+	chmod 600 "$ACCEL_CONF_FILE"
+}
+
+# 将 TCPX_HTTP_PROXY 应用到当前会话的代理环境变量 (curl / wget / yum / apt 均受益)
+apply_http_proxy_env() {
+	if [[ -n "${TCPX_HTTP_PROXY:-}" ]]; then
+		export http_proxy="$TCPX_HTTP_PROXY"
+		export https_proxy="$TCPX_HTTP_PROXY"
+		export HTTP_PROXY="$TCPX_HTTP_PROXY"
+		export HTTPS_PROXY="$TCPX_HTTP_PROXY"
+		export all_proxy="$TCPX_HTTP_PROXY"
+		export ALL_PROXY="$TCPX_HTTP_PROXY"
+	fi
+}
+
+# 生成 apt 代理参数（当用户配置了 TCPX_HTTP_PROXY 时透传给 apt/apt-get）
+apt_proxy_opts() {
+	if [[ -n "${TCPX_HTTP_PROXY:-}" ]]; then
+		printf '%s\n' "-o" "Acquire::http::Proxy=${TCPX_HTTP_PROXY}" "-o" "Acquire::https::Proxy=${TCPX_HTTP_PROXY}"
+	fi
+}
+
+# 覆盖全部 GitHub 相关域名 (含 api / raw / releases / objects / release-assets / codeload / gist)
 is_github_url() {
-	local url
-	url=$(strip_github_mirror "$1")
-	[[ "$url" =~ ^https?://(www\.)?(github\.com|api\.github\.com|raw\.githubusercontent\.com|gist\.githubusercontent\.com|objects\.githubusercontent\.com|codeload\.github\.com|release-assets\.githubusercontent\.com)(/|$) ]]
+	local url="$1"
+	[[ "$url" =~ ^https?://(www\.)?(github\.com|raw\.githubusercontent\.com|api\.github\.com|objects\.githubusercontent\.com|release-assets\.githubusercontent\.com|github-releases\.githubusercontent\.com|codeload\.github\.com|gist\.githubusercontent\.com|gist\.github\.com)/ ]]
 }
 
-# 统一的镜像 URL 组装规则 (测速、API 请求与实际下载共用，保证行为一致)
+is_github_api_url() {
+	local url="$1"
+	[[ "$url" =~ ^https?://api\.github\.com/ ]]
+}
+
+is_github_raw_url() {
+	local url="$1"
+	[[ "$url" =~ ^https?://raw\.githubusercontent\.com/ ]] || [[ "$url" =~ ^https?://(www\.)?github\.com/[^/]+/[^/]+/raw/ ]]
+}
+
+# 识别已是国内高速镜像的地址（避免套一层海外通用反代反而变慢）
+is_cn_domestic_mirror_url() {
+	local url="$1"
+	[[ "$url" =~ ^https?://(mirrors\.(tuna\.tsinghua\.edu\.cn|ustc\.edu\.cn|aliyun\.com|cloud\.tencent\.com|huaweicloud\.com|nju\.edu\.cn|163\.com|bfsu\.edu\.cn)|cnb\.cool|myip\.ipip\.net|www\.qualcomm\.cn)/ ]]
+}
+
+# 将 raw.githubusercontent.com 或 github.com/.../raw/... 转为 jsDelivr 多边缘 CDN 地址（二级兜底）
+github_raw_to_jsdelivr_urls() {
+	local url="$1" owner="" repo="" ref="" path=""
+	if [[ "$url" =~ ^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/refs/heads/([^/]+)/(.+)$ ]]; then
+		owner="${BASH_REMATCH[1]}"
+		repo="${BASH_REMATCH[2]}"
+		ref="${BASH_REMATCH[3]}"
+		path="${BASH_REMATCH[4]}"
+	elif [[ "$url" =~ ^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$ ]]; then
+		owner="${BASH_REMATCH[1]}"
+		repo="${BASH_REMATCH[2]}"
+		ref="${BASH_REMATCH[3]}"
+		path="${BASH_REMATCH[4]}"
+	elif [[ "$url" =~ ^https?://(www\.)?github\.com/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$ ]]; then
+		owner="${BASH_REMATCH[2]}"
+		repo="${BASH_REMATCH[3]}"
+		ref="${BASH_REMATCH[4]}"
+		path="${BASH_REMATCH[5]}"
+	else
+		return 1
+	fi
+	local cdn
+	for cdn in "${JSDELIVR_MIRRORS[@]}"; do
+		printf '%s/gh/%s/%s@%s/%s\n' "$cdn" "$owner" "$repo" "$ref" "$path"
+	done
+	return 0
+}
+
+# 统一的镜像 URL 组装规则 (测速与实际下载共用)
+#   use_full_url=1 (默认): 前缀 + 完整 URL (实测全部主流镜像及自建 CF Worker/Nginx 均支持)
+#   use_full_url=0        : 前缀 + 去协议头 URL (兼容少数只认去协议头格式的站点)
 build_mirror_url() {
 	local prefix="$1"
-	local raw_url
-	raw_url=$(strip_github_mirror "$2")
+	local url="$2"
+	local use_full_url="${3:-1}"
 	if [[ -z "$prefix" ]]; then
-		echo "$raw_url"
-	else
-		# 保留完整 https:// 协议头拼接 (如 https://gh-proxy.org/https://github.com/...)
-		# 现代镜像站全部兼容此格式，而剥离协议头会导致 fastgit.cc / githubproxy.cc 等直接 404
-		echo "${prefix}${raw_url}"
-	fi
-}
-
-# 将下载到本地的第三方子脚本内部的 GitHub 裸链接统一替换为当前最优加速地址
-# 避免子脚本运行中途再次直连 raw.githubusercontent.com / api.github.com / github.com 导致失败
-accelerate_script_github_urls() {
-	local file="$1"
-	[[ ! -f "$file" || "${GH_DIRECT:-0}" == "1" ]] && return 0
-
-	local dl_prefix="${BEST_MIRROR:-$GH_PROXY}"
-	[[ "$dl_prefix" == "poll" || -z "$dl_prefix" ]] && dl_prefix="${GH_DL_MIRRORS[0]}"
-	local api_prefix="${BEST_API_MIRROR:-$GH_PROXY}"
-	[[ "$api_prefix" == "poll" || -z "$api_prefix" ]] && api_prefix="${GH_API_MIRRORS[0]}"
-
-	# 跳过注释行；(^|[^/]) 保证已带镜像前缀的 .../https://github.com 不会被二次重复替换
-	sed -i -E \
-		-e '/^[[:space:]]*#/! s#(^|[^/])(https?://api\.github\.com)($|[^a-zA-Z0-9.-])#\1'"${api_prefix}"'\2\3#g' \
-		-e '/^[[:space:]]*#/! s#(^|[^/])(https?://(www\.)?(github\.com|raw\.githubusercontent\.com|gist\.githubusercontent\.com|objects\.githubusercontent\.com|codeload\.github\.com))($|[^a-zA-Z0-9.-])#\1'"${dl_prefix}"'\2\5#g' \
-		"$file"
-}
-
-# 1. 并发测速 GitHub 全功能镜像节点 (不再依赖易超时的 Cloudflare Trace，防止国内机误判为海外直连)
-check_cn_status() {
-	if [[ "${GH_DIRECT:-0}" == "1" ]]; then
-		IS_CN=0
-		BEST_MIRROR=""
-		BEST_API_MIRROR=""
-		echo -e "${INFO} 已通过 GH_DIRECT=1 启用 GitHub 直连模式。"
+		printf '%s\n' "$url"
 		return 0
 	fi
-
-	IS_CN=1
-	echo -e "${INFO} 正在并发测速 GitHub 加速镜像节点 (全链路覆盖 raw / api / releases)..."
-
-	local probe_mirrors=()
-	[[ -n "$GH_PROXY" ]] && probe_mirrors+=("$GH_PROXY")
-	local m p dup
-	for m in "${GH_API_MIRRORS[@]}"; do
-		dup=0
-		for p in "${probe_mirrors[@]}"; do
-			[[ "$p" == "$m" ]] && dup=1
-		done
-		[[ $dup -eq 0 ]] && probe_mirrors+=("$m")
-	done
-
-	local test_url="${GITHUB_RAW_URL}/tcpx.sh"
-	local probe_dir
-	probe_dir=$(mktemp -d /tmp/tcpx_mirror_probe.XXXXXX 2>/dev/null || echo "")
-
-	local best_time=9999
-	local failed_mirrors=()
-
-	if [[ -n "$probe_dir" && -d "$probe_dir" ]]; then
-		local idx=0 prefix
-		for prefix in "${probe_mirrors[@]}"; do
-			(
-				local target_url body_file meta code time_cost
-				target_url=$(build_mirror_url "$prefix" "$test_url")
-				body_file="${probe_dir}/body_${idx}"
-				meta=$(curl -sL -m 3 -r 0-256 -A "Mozilla/5.0 (compatible; tcpx/${SH_VER})" \
-					-o "$body_file" -w "%{http_code} %{time_total}" "$target_url" 2>/dev/null || echo "000 9999")
-				code=$(echo "$meta" | awk '{print $1}')
-				time_cost=$(echo "$meta" | awk '{print $2}')
-				# 同时校验 200/206 与真实脚本头 #!/，彻底排除返回 200 HTML 报错页/劫持页的失效节点
-				if [[ "$code" =~ ^(200|206)$ ]] && [[ -n "$time_cost" ]] && head -n 1 "$body_file" 2>/dev/null | grep -q '^#!'; then
-					echo "OK ${time_cost} ${prefix}" >"${probe_dir}/res_${idx}"
-				else
-					echo "FAIL 9999 ${prefix}" >"${probe_dir}/res_${idx}"
-				fi
-			) &
-			idx=$((idx + 1))
-		done
-		wait
-
-		local i st tc pf
-		for ((i = 0; i < idx; i++)); do
-			[[ -f "${probe_dir}/res_${i}" ]] || continue
-			read -r st tc pf <"${probe_dir}/res_${i}"
-			if [[ "$st" == "OK" ]]; then
-				if awk "BEGIN {exit !($tc < $best_time)}"; then
-					best_time="$tc"
-					BEST_MIRROR="$pf"
-					BEST_API_MIRROR="$pf"
-				fi
-			else
-				failed_mirrors+=("$pf")
-			fi
-		done
-		rm -rf "$probe_dir"
-	fi
-
-	if [[ "$best_time" == "9999" || -z "$BEST_MIRROR" ]]; then
-		echo -e "${TIP} 首选镜像并发探测超时，将启用全量加速池自动轮询模式。"
-		BEST_MIRROR="poll"
-		BEST_API_MIRROR="${GH_API_MIRRORS[0]}"
+	prefix=$(normalize_mirror_prefix "$prefix")
+	if [[ "$use_full_url" == "1" ]]; then
+		printf '%s%s\n' "$prefix" "$url"
 	else
-		GH_PROXY="$BEST_MIRROR"
-		echo -e "${INFO} 测速完成！当前网络最优加速镜像为: ${GREEN_FONT_PREFIX}${BEST_MIRROR}${FONT_COLOR_SUFFIX} (响应时间: ${best_time}s)"
-	fi
-
-	if [[ ${#failed_mirrors[@]} -gt 0 ]]; then
-		echo -e "${TIP} 以下镜像测速超时或响应异常 (已自动降级为后备):"
-		local fail_m
-		for fail_m in "${failed_mirrors[@]}"; do
-			echo -e "  - ${RED_FONT_PREFIX}${fail_m}${FONT_COLOR_SUFFIX}"
-		done
+		local stripped="$url"
+		stripped="${stripped#https://}"
+		stripped="${stripped#http://}"
+		printf '%s%s\n' "$prefix" "$stripped"
 	fi
 }
 
-# 2. 安全可靠的下载函数 (自带多镜像轮询 failover，支持动态最优节点与二进制防伪校验)
-safe_wget() {
-	local url="$1"
-	local dest="$2"
-	local timeout=15
-	local raw_url
-	raw_url=$(strip_github_mirror "$url")
-
-	local mirrors=()
-
-	# 非 GitHub 资源 (Debian 官方源 / cnb.cool 等) 直接直连，避免套 GitHub 镜像导致 404
-	if [[ $IS_CN -eq 0 ]] || ! is_github_url "$raw_url"; then
-		mirrors=("")
-	else
-		[[ -n "$BEST_MIRROR" && "$BEST_MIRROR" != "poll" ]] && mirrors+=("$BEST_MIRROR")
-		local cand existing dup
-		for cand in "$GH_PROXY" "${GH_DL_MIRRORS[@]}"; do
-			[[ -z "$cand" ]] && continue
-			dup=0
-			for existing in "${mirrors[@]}"; do
-				[[ "$existing" == "$cand" ]] && dup=1
-			done
-			[[ $dup -eq 0 ]] && mirrors+=("$cand")
-		done
-		# 仅在所有加速镜像全部失败后，才尝试原生直连作为终极兜底
-		mirrors+=("")
+# 获取某镜像默认偏好的拼接模式 (1=完整URL, 0=去协议头)
+get_mirror_preferred_mode() {
+	local prefix
+	prefix=$(normalize_mirror_prefix "$1")
+	if [[ -n "${MIRROR_URL_MODE[$prefix]:-}" ]]; then
+		printf '%s' "${MIRROR_URL_MODE[$prefix]}"
+		return 0
 	fi
+	printf '1'
+}
 
-	local prefix target_url
-	for prefix in "${mirrors[@]}"; do
-		target_url=$(build_mirror_url "$prefix" "$raw_url")
+# 判断文件内容是否为 HTML（防止失效镜像返回 HTTP 200 首页/错误页污染下载）
+is_html_file() {
+	local file="$1"
+	local head_txt
+	head_txt=$(head -c 512 "$file" 2>/dev/null | tr '\0' ' ')
+	printf '%s' "$head_txt" | grep -qiE '^[[:space:]]*(<!DOCTYPE[[:space:]]+html|<html[[:space:]>]|<head[[:space:]>]|<title>)'
+}
 
-		if [[ -z "$prefix" ]]; then
-			echo -e "${INFO} 正在请求: ${dest} (直连兜底) ..."
+# 按文件类型做魔数与防 HTML 校验（无上游 SHA-256 时的关键防线）
+validate_downloaded_file() {
+	local file="$1"
+	local hint_dest="${2:-$file}"
+	local hint_url="${3:-}"
+	[[ -s "$file" ]] || return 1
+
+	local clean_url="${hint_url%%\?*}"
+	local lower_dest="${hint_dest,,}"
+	local lower_url="${clean_url,,}"
+	local ext_hint="$lower_dest"
+	case "$lower_dest" in
+	*.deb | *.rpm | *.tar.gz | *.tgz | *.gz | *.sh | *.json | *.key | *.gpg) ;;
+	*) ext_hint="$lower_url" ;;
+	esac
+
+	local magic=""
+	case "$ext_hint" in
+	*.deb)
+		head -c 8 "$file" 2>/dev/null | grep -q '!<arch>' || return 1
+		;;
+	*.rpm)
+		if command -v od >/dev/null 2>&1; then
+			magic=$(od -An -tx1 -N4 "$file" 2>/dev/null | tr -d ' \n\r')
+			[[ "$magic" == "edabeedb" ]] || return 1
 		else
-			echo -e "${INFO} 正在请求: ${dest} (加速镜像: ${prefix}) ..."
+			is_html_file "$file" && return 1
 		fi
-
-		if wget --no-check-certificate --user-agent="Mozilla/5.0 (compatible; tcpx/${SH_VER})" -qT "$timeout" -t 2 -O "$dest" "$target_url"; then
-			if [[ -s "$dest" ]]; then
-				# 防御镜像站返回 200 HTML 报错页伪装成二进制归档包
-				if [[ "$raw_url" =~ \.(deb|rpm|tar\.gz|tgz|xz|bz2)(\?.*)?$ ]] && head -c 128 "$dest" 2>/dev/null | grep -qiE '<!doctype html|<html'; then
-					echo -e "${TIP} 节点返回了 HTML 错误页而非二进制包，继续切换备用镜像..."
-					rm -f "$dest"
-				else
-					echo -e "${INFO} ${dest} 下载成功！"
-					return 0
-				fi
-			else
-				echo -e "${TIP} 下载内容为空，判定为无效响应。"
-				rm -f "$dest"
-			fi
+		;;
+	*.tar.gz | *.tgz | *.gz)
+		if command -v od >/dev/null 2>&1; then
+			magic=$(od -An -tx1 -N2 "$file" 2>/dev/null | tr -d ' \n\r')
+			[[ "$magic" == "1f8b" ]] || return 1
+		else
+			is_html_file "$file" && return 1
 		fi
+		;;
+	*.sh)
+		head -n 1 "$file" 2>/dev/null | grep -qE '^#!.*(bash|sh|awk)' || return 1
+		;;
+	*.json)
+		is_html_file "$file" && return 1
+		head -c 64 "$file" 2>/dev/null | grep -qE '^[[:space:]]*[\[\{]' || return 1
+		;;
+	*.html | *.htm)
+		;;
+	*)
+		is_html_file "$file" && return 1
+		;;
+	esac
+	return 0
+}
 
-		echo -e "${TIP} 当前节点下载异常，正在无缝切换备用节点..."
+# 探测单个文件镜像：同时校验 HTTP 状态码 (200/206) 与真实 SHA256 内容，彻底免疫假 200 HTML 页
+mirror_probe() {
+	local prefix="$1"
+	local url="$2"
+	local max_time="${3:-3}"
+	local range_limit="${4:-512}"
+
+	local tmp_body probe http_code time_cost mode
+	tmp_body=$(mktemp /tmp/tcpx_mp.XXXXXX) || return 1
+
+	for mode in 1 0; do
+		probe=$(curl -q -sL -m "$max_time" -r "0-${range_limit}" -o "$tmp_body" \
+			-w "%{http_code} %{time_total}" \
+			"$(build_mirror_url "$prefix" "$url" "$mode")" 2>/dev/null)
+		http_code=${probe%% *}
+		time_cost=${probe#* }
+		[[ "$time_cost" == "$probe" ]] && time_cost=""
+
+		if [[ "$http_code" =~ ^(200|206)$ && -n "$time_cost" ]] &&
+			! is_html_file "$tmp_body" &&
+			head -c 128 "$tmp_body" 2>/dev/null | grep -qE '^[0-9a-fA-F]{64}'; then
+			PROBE_HTTP="$http_code"
+			PROBE_TIME="$time_cost"
+			PROBE_FULL_URL="$mode"
+			PROBE_OK=1
+			rm -f "$tmp_body"
+			return 0
+		fi
+		# 连接超时/无法建立连接时不浪费时间重试第二种拼法
+		[[ -z "$http_code" || "$http_code" == "000" ]] && break
 	done
 
-	echo -e "${ERROR} 文件 ${dest} 所有下载节点均失效，请检查网络或稍后再试！"
+	PROBE_HTTP="${http_code:-000}"
+	PROBE_TIME="${time_cost:-}"
+	PROBE_FULL_URL=1
+	PROBE_OK=0
+	rm -f "$tmp_body"
 	return 1
 }
 
-# 2.5 GitHub REST API 专用多镜像轮询请求器 (解决国内 api.github.com 受阻及单节点频率限制)
-fetch_github_api() {
-	local api_url
-	api_url=$(strip_github_mirror "$1")
-	local candidates=()
+# 探测单个 GitHub API 镜像：验证 HTTP 200 + 真实 JSON + 未触发 API 限速
+api_mirror_probe() {
+	local prefix="$1"
+	local api_url="$2"
+	local max_time="${3:-4}"
 
-	if [[ $IS_CN -eq 0 ]]; then
-		candidates=("")
-	else
-		[[ -n "$BEST_API_MIRROR" && "$BEST_API_MIRROR" != "poll" ]] && candidates+=("$BEST_API_MIRROR")
-		local cand existing dup
-		for cand in "$GH_PROXY" "${GH_API_MIRRORS[@]}"; do
-			[[ -z "$cand" ]] && continue
-			dup=0
-			for existing in "${candidates[@]}"; do
-				[[ "$existing" == "$cand" ]] && dup=1
-			done
-			[[ $dup -eq 0 ]] && candidates+=("$cand")
-		done
-		candidates+=("")
-	fi
+	local tmp_body probe http_code time_cost mode
+	tmp_body=$(mktemp /tmp/tcpx_ap.XXXXXX) || return 1
 
-	local prefix target_url resp rate_limited=0
-	for prefix in "${candidates[@]}"; do
-		target_url=$(build_mirror_url "$prefix" "$api_url")
-		resp=$(curl -fsSL --max-time 10 -A "Mozilla/5.0 (compatible; tcpx/${SH_VER})" "$target_url" 2>/dev/null || echo "")
-		[[ -z "$resp" ]] && continue
-		if echo "$resp" | grep -q "API rate limit exceeded"; then
-			rate_limited=1
-			continue
-		fi
-		# 校验确实是合法的 GitHub Releases JSON 响应，排除镜像站 HTML 错误页
-		if echo "$resp" | grep -qE '"browser_download_url"|"tag_name"|\[\s*\]'; then
-			printf '%s\n' "$resp"
+	for mode in 1 0; do
+		probe=$(curl -q -sL -m "$max_time" -H "User-Agent: tcpx-cn-accel/2.0" -H "Accept: application/vnd.github+json" \
+			-o "$tmp_body" -w "%{http_code} %{time_total}" \
+			"$(build_mirror_url "$prefix" "$api_url" "$mode")" 2>/dev/null)
+		http_code=${probe%% *}
+		time_cost=${probe#* }
+		[[ "$time_cost" == "$probe" ]] && time_cost=""
+
+		if [[ "$http_code" == "200" && -n "$time_cost" ]] &&
+			! is_html_file "$tmp_body" &&
+			! grep -qiE 'API rate limit exceeded|secondary rate limit' "$tmp_body" 2>/dev/null &&
+			grep -q '"tag_name"' "$tmp_body" 2>/dev/null; then
+			PROBE_HTTP="$http_code"
+			PROBE_TIME="$time_cost"
+			PROBE_FULL_URL="$mode"
+			PROBE_OK=1
+			rm -f "$tmp_body"
 			return 0
+		fi
+		[[ -z "$http_code" || "$http_code" == "000" ]] && break
+	done
+
+	PROBE_HTTP="${http_code:-000}"
+	PROBE_TIME="${time_cost:-}"
+	PROBE_FULL_URL=1
+	PROBE_OK=0
+	rm -f "$tmp_body"
+	return 1
+}
+
+# 并行探测所有 GitHub 文件镜像与 API 镜像 (总耗时仅约 2~4 秒)
+probe_github_mirrors() {
+	local probe_dir
+	probe_dir=$(mktemp -d /tmp/tcpx_probe.XXXXXX) || return 1
+
+	local file_candidates=(
+		"https://edgeone.gh-proxy.org/"
+		"https://cdn.gh-proxy.org/"
+		"https://gh-proxy.com/"
+		"https://gh-proxy.org/"
+		"https://v6.gh-proxy.org/"
+		"https://ghfast.top/"
+		"https://ghproxy.net/"
+		"https://githubproxy.cc/"
+		"https://wget.la/"
+	)
+	local test_file_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64.sha256"
+	local api_test_url="https://api.github.com/repos/ylx2016/Linux-NetSpeed/releases/tags/kernels"
+
+	local idx=0 prefix
+	for prefix in "${file_candidates[@]}"; do
+		idx=$((idx + 1))
+		(
+			if mirror_probe "$prefix" "$test_file_url" 3 512; then
+				printf '%s|%s|%s\n' "$PROBE_TIME" "$prefix" "$PROBE_FULL_URL" >"${probe_dir}/file_${idx}.ok"
+			else
+				printf '%s|%s\n' "$prefix" "${PROBE_HTTP:-000}" >"${probe_dir}/file_${idx}.fail"
+			fi
+		) &
+	done
+
+	local aidx=0
+	for prefix in "${GH_API_MIRRORS[@]}"; do
+		aidx=$((aidx + 1))
+		(
+			if api_mirror_probe "$prefix" "$api_test_url" 4; then
+				printf '%s|%s|%s\n' "$PROBE_TIME" "$prefix" "$PROBE_FULL_URL" >"${probe_dir}/api_${aidx}.ok"
+			else
+				printf '%s|%s\n' "$prefix" "${PROBE_HTTP:-000}" >"${probe_dir}/api_${aidx}.fail"
+			fi
+		) &
+	done
+
+	wait
+
+	# 汇总文件镜像最优结果
+	local best_time="9999" f t p m
+	BEST_MIRROR="poll"
+	BEST_MIRROR_FULL_URL=1
+	for f in "${probe_dir}"/file_*.ok; do
+		[[ -f "$f" ]] || continue
+		IFS='|' read -r t p m <"$f"
+		MIRROR_URL_MODE["$p"]="$m"
+		if awk "BEGIN {exit !($t < $best_time)}"; then
+			best_time="$t"
+			BEST_MIRROR="$p"
+			BEST_MIRROR_FULL_URL="$m"
 		fi
 	done
 
-	if [[ $rate_limited -eq 1 ]]; then
-		echo -e "${ERROR} GitHub API 加速镜像节点触发频率限制，请稍后再试！" >&2
+	# 汇总 API 镜像最优结果
+	local best_api_time="9999"
+	BEST_API_MIRROR="poll"
+	BEST_API_MIRROR_FULL_URL=1
+	for f in "${probe_dir}"/api_*.ok; do
+		[[ -f "$f" ]] || continue
+		IFS='|' read -r t p m <"$f"
+		if awk "BEGIN {exit !($t < $best_api_time)}"; then
+			best_api_time="$t"
+			BEST_API_MIRROR="$p"
+			BEST_API_MIRROR_FULL_URL="$m"
+		fi
+	done
+
+	if [[ "$BEST_MIRROR" != "poll" ]]; then
+		echo -e "${INFO} 最优 GitHub 文件/Raw 镜像: ${GREEN_FONT_PREFIX}${BEST_MIRROR}${FONT_COLOR_SUFFIX} (${best_time}s)"
+	else
+		echo -e "${TIP} 公共文件镜像测速均超时，下载时将自动全池轮询并保留 jsDelivr/直连兜底。"
 	fi
+
+	if [[ "$BEST_API_MIRROR" != "poll" ]]; then
+		echo -e "${INFO} 最优 GitHub API 镜像     : ${GREEN_FONT_PREFIX}${BEST_API_MIRROR}${FONT_COLOR_SUFFIX} (${best_api_time}s)"
+	else
+		echo -e "${TIP} 公共 API 镜像测速均超时或受限，请求时将自动全池轮询并保留直连兜底。"
+	fi
+
+	local failed_list=()
+	for f in "${probe_dir}"/file_*.fail; do
+		[[ -f "$f" ]] || continue
+		IFS='|' read -r p m <"$f"
+		failed_list+=("${p} (${m})")
+	done
+	if [[ ${#failed_list[@]} -gt 0 ]]; then
+		echo -e "${TIP} 已自动剔除不可用文件镜像: ${failed_list[*]}"
+	fi
+
+	rm -rf "$probe_dir"
+}
+
+# 懒加载并测速国内 Debian 官方镜像（用于 Cloud 内核池与 Backports）
+ensure_debian_mirror() {
+	if [[ -n "$TCPX_DEBIAN_MIRROR" ]]; then
+		BEST_DEBIAN_MIRROR="$TCPX_DEBIAN_MIRROR"
+		CLOUD_HDR_POOL="${BEST_DEBIAN_MIRROR}/pool/main/l/linux/"
+		return 0
+	fi
+	if [[ -n "$BEST_DEBIAN_MIRROR" ]]; then
+		CLOUD_HDR_POOL="${BEST_DEBIAN_MIRROR}/pool/main/l/linux/"
+		return 0
+	fi
+	if [[ $IS_CN -eq 0 ]]; then
+		BEST_DEBIAN_MIRROR="https://deb.debian.org/debian"
+		CLOUD_HDR_POOL="${BEST_DEBIAN_MIRROR}/pool/main/l/linux/"
+		return 0
+	fi
+
+	local probe_dir idx=0 m
+	probe_dir=$(mktemp -d /tmp/tcpx_deb.XXXXXX) || {
+		BEST_DEBIAN_MIRROR="https://deb.debian.org/debian"
+		CLOUD_HDR_POOL="${BEST_DEBIAN_MIRROR}/pool/main/l/linux/"
+		return 0
+	}
+	echo -e "${INFO} 正在测速国内 Debian 镜像源 (清华/中科大/阿里云/腾讯云/华为云)..." >&2
+	for m in "${CN_DEBIAN_MIRRORS[@]}"; do
+		idx=$((idx + 1))
+		(
+			local res code t
+			res=$(curl -q -sL -m 3 -r 0-256 -o /dev/null -w "%{http_code} %{time_total}" "${m}/pool/main/l/linux/" 2>/dev/null)
+			code=${res%% *}
+			t=${res#* }
+			if [[ "$code" =~ ^(200|206)$ && -n "$t" && "$t" != "$res" ]]; then
+				printf '%s|%s\n' "$t" "$m" >"${probe_dir}/deb_${idx}.ok"
+			fi
+		) &
+	done
+	wait
+
+	local best_t="9999" best_m="" f t
+	for f in "${probe_dir}"/deb_*.ok; do
+		[[ -f "$f" ]] || continue
+		IFS='|' read -r t m <"$f"
+		if awk "BEGIN {exit !($t < $best_t)}"; then
+			best_t="$t"
+			best_m="$m"
+		fi
+	done
+	rm -rf "$probe_dir"
+
+	if [[ -n "$best_m" ]]; then
+		BEST_DEBIAN_MIRROR="$best_m"
+		echo -e "${INFO} 已选用最快国内 Debian 镜像: ${GREEN_FONT_PREFIX}${BEST_DEBIAN_MIRROR}${FONT_COLOR_SUFFIX} (${best_t}s)" >&2
+	else
+		BEST_DEBIAN_MIRROR="https://deb.debian.org/debian"
+		echo -e "${TIP} 国内 Debian 镜像测速均失败，回退至官方源 ${BEST_DEBIAN_MIRROR}" >&2
+	fi
+	CLOUD_HDR_POOL="${BEST_DEBIAN_MIRROR}/pool/main/l/linux/"
+}
+
+# 懒加载并测速国内 ELRepo 官方镜像（用于 CentOS/Alma/Rocky kernel-ml）
+ensure_elrepo_mirror() {
+	if [[ -n "$TCPX_ELREPO_MIRROR" ]]; then
+		BEST_ELREPO_MIRROR="$TCPX_ELREPO_MIRROR"
+		return 0
+	fi
+	if [[ -n "$BEST_ELREPO_MIRROR" ]]; then
+		return 0
+	fi
+	if [[ $IS_CN -eq 0 ]]; then
+		BEST_ELREPO_MIRROR=""
+		return 0
+	fi
+
+	local el_ver="${OS_VERSION_ID:-9}"
+	local probe_dir idx=0 m
+	probe_dir=$(mktemp -d /tmp/tcpx_elr.XXXXXX) || return 0
+	echo -e "${INFO} 正在测速国内 ELRepo 镜像源 (清华/阿里云/中科大)..." >&2
+	for m in "${CN_ELREPO_MIRRORS[@]}"; do
+		idx=$((idx + 1))
+		(
+			local res code t
+			res=$(curl -q -sL -m 3 -o /dev/null -w "%{http_code} %{time_total}" "${m}/kernel/el${el_ver}/x86_64/repodata/repomd.xml" 2>/dev/null)
+			code=${res%% *}
+			t=${res#* }
+			if [[ "$code" == "200" && -n "$t" && "$t" != "$res" ]]; then
+				printf '%s|%s\n' "$t" "$m" >"${probe_dir}/elr_${idx}.ok"
+			fi
+		) &
+	done
+	wait
+
+	local best_t="9999" best_m="" f t
+	for f in "${probe_dir}"/elr_*.ok; do
+		[[ -f "$f" ]] || continue
+		IFS='|' read -r t m <"$f"
+		if awk "BEGIN {exit !($t < $best_t)}"; then
+			best_t="$t"
+			best_m="$m"
+		fi
+	done
+	rm -rf "$probe_dir"
+
+	if [[ -n "$best_m" ]]; then
+		BEST_ELREPO_MIRROR="$best_m"
+		echo -e "${INFO} 已选用最快国内 ELRepo 镜像: ${GREEN_FONT_PREFIX}${BEST_ELREPO_MIRROR}${FONT_COLOR_SUFFIX} (${best_t}s)" >&2
+	else
+		BEST_ELREPO_MIRROR=""
+	fi
+}
+
+# curl 的 HTTPS 严格参数：-q 不读取 curlrc；--proto/--proto-redir 需要 curl 7.20.2+。
+curl_secure_args() {
+	if [[ -z "${TCPX_CURL_STRICT:-}" ]]; then
+		if curl -q --proto '=https' --proto-redir '=https' --version >/dev/null 2>&1; then
+			TCPX_CURL_STRICT=1
+		else
+			TCPX_CURL_STRICT=0
+		fi
+	fi
+	if [[ "$TCPX_CURL_STRICT" == "1" ]]; then
+		printf '%s\n' -q -fsSL --proto =https --proto-redir =https
+	else
+		echo -e "${TIP} 当前 curl 不支持中继协议限制参数，已改为下载后复核最终 URL 必须为 HTTPS。" >&2
+		printf '%s\n' -q -fsSL --proto =https
+	fi
+}
+
+# 单次下载尝试 (统一使用 curl，天然支持 HTTP/HTTPS/SOCKS5 代理、断速自动切换、TLS 校验、SHA-256 与魔数校验)
+download_once() {
+	local prefix="$1"
+	local url="$2"
+	local dest="$3"
+	local use_full_url="${4:-1}"
+	local timeout="${5:-15}"
+	local expected_sha256="${6:-}"
+	local target_url http_log curl_meta http_code effective dl_bytes dl_speed downloaded=0
+	DOWNLOAD_HTTP=""
+
+	[[ "$url" == https://* && ( -z "$prefix" || "$prefix" == https://* ) ]] || {
+		echo -e "${ERROR} 下载地址必须使用 HTTPS。" >&2
+		return 1
+	}
+
+	if [[ -n "$expected_sha256" ]]; then
+		if [[ ! "$expected_sha256" =~ ^[a-fA-F0-9]{64}$ ]] || ! command -v sha256sum >/dev/null 2>&1; then
+			echo -e "${ERROR} 摘要格式无效或缺少 sha256sum，拒绝跳过制品校验。" >&2
+			DOWNLOAD_HTTP="digest-unavailable"
+			return 1
+		fi
+		expected_sha256="${expected_sha256,,}"
+	elif [[ "${TCPX_STRICT_DIGEST:-0}" == "1" && ( -n "$prefix" || "${TCPX_TLS_INSECURE:-0}" == "1" ) ]]; then
+		echo -e "${ERROR} 严格摘要模式下，无独立摘要时禁止使用第三方镜像或关闭 TLS 校验。" >&2
+		DOWNLOAD_HTTP="unauthenticated-source"
+		return 1
+	elif [[ "${TCPX_TLS_INSECURE:-0}" == "1" ]]; then
+		echo -e "${ERROR} 无独立摘要时禁止关闭 TLS 证书校验。" >&2
+		DOWNLOAD_HTTP="unauthenticated-source"
+		return 1
+	fi
+
+	target_url=$(build_mirror_url "$prefix" "$url" "$use_full_url")
+	if [[ -z "$prefix" ]]; then
+		echo -e "${INFO} 正在下载: ${dest} (直连) ..."
+	else
+		echo -e "${INFO} 正在下载: ${dest} (加速节点: ${prefix}) ..."
+	fi
+
+	http_log=$(mktemp /tmp/tcpx_dl.XXXXXX) || return 1
+	local curl_args=() curl_arg
+	while IFS= read -r curl_arg; do
+		[[ -n "$curl_arg" ]] && curl_args+=("$curl_arg")
+	done < <(curl_secure_args)
+	if [[ -n "$expected_sha256" && "${TCPX_TLS_INSECURE:-0}" == "1" ]]; then
+		curl_args+=(-k)
+		echo -e "${TIP} 已按 TCPX_TLS_INSECURE=1 关闭连接证书校验；仍强制核验独立 SHA-256。" >&2
+	fi
+
+	# 连接超时 timeout 秒；若连续 20 秒速率低于 1KB/s 自动中止并切换备用镜像，避免卡死
+	if curl_meta=$(curl "${curl_args[@]}" \
+		-H "User-Agent: tcpx-cn-accel/2.0" \
+		--connect-timeout "$timeout" --speed-time 20 --speed-limit 1024 --retry 1 \
+		-o "$dest" -w '%{http_code} %{url_effective} %{size_download} %{speed_download}' \
+		"$target_url" 2>"$http_log"); then
+		read -r http_code effective dl_bytes dl_speed <<<"$curl_meta"
+		if [[ "$effective" != https://* ]]; then
+			echo -e "${ERROR} 下载最终落点不是 HTTPS (${effective})，已拒绝该内容。" >&2
+			DOWNLOAD_HTTP="insecure-redirect"
+			rm -f "$http_log" "$dest"
+			return 1
+		fi
+		downloaded=1
+	else
+		http_code=$(grep -oE 'returned error: [0-9]{3}' "$http_log" 2>/dev/null | awk '{print $NF}' | tail -n 1)
+	fi
+	DOWNLOAD_HTTP="${http_code:-000}"
+
+	if [[ "$downloaded" == "1" && -s "$dest" ]]; then
+		if [[ -n "$expected_sha256" ]]; then
+			local actual_sha256
+			if ! actual_sha256=$(sha256sum -- "$dest" 2>/dev/null); then
+				rm -f "$http_log" "$dest"
+				DOWNLOAD_HTTP="digest-error"
+				return 1
+			fi
+			actual_sha256="${actual_sha256%% *}"
+			if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+				echo -e "${ERROR} ${dest} SHA-256 校验不匹配，已丢弃该节点内容并切换下一节点！" >&2
+				rm -f "$http_log" "$dest"
+				DOWNLOAD_HTTP="digest-mismatch"
+				return 1
+			fi
+		else
+			if ! validate_downloaded_file "$dest" "$dest" "$url"; then
+				echo -e "${TIP} 节点返回内容未通过格式校验 (疑似错误页/截断文件)，自动切换下一节点..." >&2
+				rm -f "$http_log" "$dest"
+				DOWNLOAD_HTTP="invalid-content"
+				return 1
+			fi
+		fi
+
+		DOWNLOAD_HTTP=200
+		rm -f "$http_log"
+		local speed_str=""
+		if [[ -n "${dl_speed:-}" ]]; then
+			speed_str=$(awk -v b="${dl_bytes:-0}" -v s="${dl_speed:-0}" 'BEGIN {
+				if (b >= 1048576) sz = sprintf("%.2fMB", b/1048576);
+				else if (b >= 1024) sz = sprintf("%.1fKB", b/1024);
+				else sz = sprintf("%dB", b);
+				if (s >= 1048576) sp = sprintf("%.2fMB/s", s/1048576);
+				else sp = sprintf("%.1fKB/s", s/1024);
+				printf "%s, %s", sz, sp;
+			}')
+		fi
+		if [[ -n "$expected_sha256" ]]; then
+			echo -e "${INFO} ${dest} 下载成功 (${speed_str:-OK}, SHA-256 已验证)！"
+		else
+			echo -e "${INFO} ${dest} 下载成功 (${speed_str:-OK})！"
+		fi
+		return 0
+	fi
+
+	echo -e "${TIP} 节点下载失败 (HTTP ${DOWNLOAD_HTTP:-000})，已丢弃不完整内容。" >&2
+	rm -f "$http_log" "$dest"
+	return 1
+}
+
+# 从端点响应解析 ISO 国家码；无法识别时输出空串。
+parse_geo_country() {
+	local kind="$1" body="${2//$'\r'/}" line
+	case "$kind" in
+	cf)
+		line=$(printf '%s\n' "$body" | grep -m1 -E '^loc=[A-Z]{2}$') || return 0
+		printf '%s' "${line#loc=}"
+		;;
+	code)
+		line=$(printf '%s' "$body" | tr -d '[:space:]')
+		[[ "$line" =~ ^[A-Z]{2}$ ]] && printf '%s' "$line"
+		;;
+	cn)
+		line=$(printf '%s\n' "$body" | grep -m1 -E '来自于：中国') || return 0
+		case "$line" in
+		*香港*) printf 'HK' ;;
+		*澳门*) printf 'MO' ;;
+		*台湾*) printf 'TW' ;;
+		*) printf 'CN' ;;
+		esac
+		;;
+	esac
+}
+
+# 在指定地址族下依次尝试所有端点，输出第一个有效国家码。
+detect_geo_country() {
+	local family="$1" entry kind url body country
+	for entry in "${CN_STATUS_ENDPOINTS[@]}"; do
+		kind=${entry%%|*}
+		url=${entry#*|}
+		body=$(curl -q "-${family}" -fsL --max-time "$CN_STATUS_TIMEOUT" "$url" 2>/dev/null) || continue
+		country=$(parse_geo_country "$kind" "$body")
+		[[ -n "$country" ]] && {
+			printf '%s' "$country"
+			return 0
+		}
+	done
+	return 1
+}
+
+# 1. 网络环境检测与全链路镜像初始化
+check_cn_status() {
+	load_accel_config
+
+	# 用户显式强制海外直连
+	if [[ "$TCPX_FORCE_CN" == "0" ]]; then
+		IS_CN=0
+		echo -e "${INFO} 已按配置启用海外直连模式 (TCPX_FORCE_CN=0)。"
+		[[ -n "$TCPX_UNIVERSAL_PROXY" ]] && echo -e "${INFO} 已启用自定义全站反代: ${GREEN_FONT_PREFIX}${TCPX_UNIVERSAL_PROXY}${FONT_COLOR_SUFFIX}"
+		[[ -n "$TCPX_HTTP_PROXY" ]] && echo -e "${INFO} 已启用系统代理: ${GREEN_FONT_PREFIX}${TCPX_HTTP_PROXY}${FONT_COLOR_SUFFIX}"
+		return 0
+	fi
+
+	# 判断网络归属 (支持强制国内加速)
+	local country="" ip_version
+	if [[ "$TCPX_FORCE_CN" == "1" ]]; then
+		IS_CN=1
+		echo -e "${INFO} 已按配置强制启用国内全链路加速模式 (TCPX_FORCE_CN=1)。"
+	else
+		for ip_version in 4 6; do
+			country=$(detect_geo_country "$ip_version") || country=""
+			[[ -n "$country" ]] && break
+		done
+		if [[ "$country" == "CN" ]]; then
+			IS_CN=1
+			echo -e "${INFO} 检测到当前节点位于中国大陆，正在并行测速 GitHub 文件与 API 加速节点..."
+		elif [[ -n "$country" ]]; then
+			IS_CN=0
+			echo -e "${INFO} 当前节点位于海外 (${country})，默认使用直连网络。"
+			[[ -n "$TCPX_MIRROR" ]] && echo -e "${INFO} 已配置自定义 GitHub 镜像: ${GREEN_FONT_PREFIX}${TCPX_MIRROR}${FONT_COLOR_SUFFIX}"
+			[[ -n "$TCPX_UNIVERSAL_PROXY" ]] && echo -e "${INFO} 已配置自定义全站反代: ${GREEN_FONT_PREFIX}${TCPX_UNIVERSAL_PROXY}${FONT_COLOR_SUFFIX}"
+			return 0
+		else
+			IS_CN=2
+			echo -e "${TIP} 归属地检测超时，默认启用国内全链路加速模式 (镜像优先 + 直连兜底)..."
+		fi
+	fi
+
+	[[ -n "$TCPX_HTTP_PROXY" ]] && echo -e "${INFO} 已启用 HTTP/SOCKS 代理: ${GREEN_FONT_PREFIX}${TCPX_HTTP_PROXY}${FONT_COLOR_SUFFIX}"
+	if [[ -n "$TCPX_UNIVERSAL_PROXY" ]]; then
+		echo -e "${INFO} 已优先使用自建全站通用反代: ${GREEN_FONT_PREFIX}${TCPX_UNIVERSAL_PROXY}${FONT_COLOR_SUFFIX}"
+	fi
+	if [[ -n "$TCPX_MIRROR" ]]; then
+		echo -e "${INFO} 已优先使用自定义 GitHub 镜像: ${GREEN_FONT_PREFIX}${TCPX_MIRROR}${FONT_COLOR_SUFFIX}"
+	fi
+	if [[ -n "$TCPX_API_MIRROR" ]]; then
+		echo -e "${INFO} 已优先使用自定义 GitHub API 镜像: ${GREEN_FONT_PREFIX}${TCPX_API_MIRROR}${FONT_COLOR_SUFFIX}"
+	fi
+
+	# 若未通过自建全站反代全覆盖，则仍做快速并行探测作为无缝兜底
+	if [[ -z "$TCPX_UNIVERSAL_PROXY" && ( -z "$TCPX_MIRROR" || -z "$TCPX_API_MIRROR" ) ]]; then
+		probe_github_mirrors
+	fi
+}
+
+# 向候选数组去重追加项 (兼容 Bash 4.2)
+_append_unique_mirror() {
+	local val="$1" existing
+	shift
+	for existing in "$@"; do
+		[[ "$existing" == "$val" ]] && return 1
+	done
+	return 0
+}
+
+# 2. 全链路安全可靠下载函数
+#    - GitHub 资源 (raw / release / archive / objects): 自定义镜像 -> 最优测速节点 -> 全池轮询 -> jsDelivr (Raw) -> 直连兜底
+#    - 非 GitHub 海外资源 (XanMod / Liquorix / Brutal / ELRepo / Snapshot): 若配置了 TCPX_UNIVERSAL_PROXY 则优先走反代 -> 直连兜底
+safe_wget() {
+	local url="$1"
+	local dest="$2"
+	local expected_sha256="${3:-}"
+	local timeout=15
+
+	local mirrors=() m
+
+	if is_github_url "$url"; then
+		if [[ "${TCPX_STRICT_DIGEST:-0}" == "1" && -z "$expected_sha256" ]]; then
+			echo -e "${TIP} 严格摘要模式且上游无摘要，本次仅使用上游 HTTPS 直连。" >&2
+			mirrors=("")
+		elif [[ $IS_CN -eq 0 && -z "$TCPX_MIRROR" && -z "$TCPX_RAW_MIRROR" && -z "$TCPX_UNIVERSAL_PROXY" ]]; then
+			mirrors=("")
+		else
+			if is_github_raw_url "$url" && [[ -n "$TCPX_RAW_MIRROR" ]]; then
+				mirrors+=("$TCPX_RAW_MIRROR")
+			fi
+			if [[ -n "$TCPX_MIRROR" ]] && _append_unique_mirror "$TCPX_MIRROR" "${mirrors[@]}"; then
+				mirrors+=("$TCPX_MIRROR")
+			fi
+			if [[ -n "$TCPX_UNIVERSAL_PROXY" ]] && _append_unique_mirror "$TCPX_UNIVERSAL_PROXY" "${mirrors[@]}"; then
+				mirrors+=("$TCPX_UNIVERSAL_PROXY")
+			fi
+			if [[ -n "$BEST_MIRROR" && "$BEST_MIRROR" != "poll" ]] && _append_unique_mirror "$BEST_MIRROR" "${mirrors[@]}"; then
+				mirrors+=("$BEST_MIRROR")
+			fi
+			for m in "${GH_FILE_MIRRORS[@]}"; do
+				_append_unique_mirror "$m" "${mirrors[@]}" && mirrors+=("$m")
+			done
+			mirrors+=("")
+		fi
+	else
+		if [[ -n "$TCPX_UNIVERSAL_PROXY" ]] && ! is_cn_domestic_mirror_url "$url"; then
+			mirrors=("$TCPX_UNIVERSAL_PROXY" "")
+		else
+			mirrors=("")
+		fi
+	fi
+
+	local prefix pref_mode alt_mode tried_alt
+	for prefix in "${mirrors[@]}"; do
+		pref_mode=1
+		[[ -n "$prefix" ]] && pref_mode=$(get_mirror_preferred_mode "$prefix")
+		alt_mode=$((1 - pref_mode))
+		tried_alt=0
+
+		while :; do
+			if download_once "$prefix" "$url" "$dest" "$pref_mode" "$timeout" "$expected_sha256"; then
+				[[ -n "$prefix" ]] && MIRROR_URL_MODE["$(normalize_mirror_prefix "$prefix")"]="$pref_mode"
+				return 0
+			fi
+			if [[ -n "$prefix" && "$tried_alt" == "0" && ( "$DOWNLOAD_HTTP" == "404" || "$DOWNLOAD_HTTP" == "400" || "$DOWNLOAD_HTTP" == "invalid-content" ) ]]; then
+				echo -e "${TIP} 节点 ${prefix} 尝试切换另一种 URL 拼接格式重试..." >&2
+				pref_mode="$alt_mode"
+				tried_alt=1
+				continue
+			fi
+			break
+		done
+
+		[[ ${#mirrors[@]} -gt 1 ]] && echo -e "${TIP} 正在无缝切换至下一个备用节点..." >&2
+	done
+
+	# Raw 文件二级 CDN 兜底：jsDelivr (Fastly / Gcore / TestingCF)
+	if [[ $IS_CN -ne 0 && "${TCPX_STRICT_DIGEST:-0}" != "1" ]] && is_github_raw_url "$url"; then
+		local jsd_url
+		while IFS= read -r jsd_url; do
+			[[ -z "$jsd_url" ]] && continue
+			echo -e "${TIP} 尝试 jsDelivr CDN 二级兜底: ${jsd_url}" >&2
+			if download_once "" "$jsd_url" "$dest" 1 "$timeout" "$expected_sha256"; then
+				return 0
+			fi
+		done < <(github_raw_to_jsdelivr_urls "$url")
+	fi
+
+	echo -e "${ERROR} 文件 ${dest} 所有下载节点均失效，请检查网络或在菜单 [70] 配置自建加速反代/代理！" >&2
+	return 1
+}
+
+# 3. GitHub REST API 全链路加速请求函数
+#    - 内置 300 秒会话缓存，避免同一仓库重复请求 (installbbr 等一次安装只需 1 次 API 请求)
+#    - 多 API 镜像自动容灾，触发 403 频率限制自动轮换下一节点
+#    - 安全原则：TCPX_GITHUB_TOKEN 仅发往直连 api.github.com 或用户自建私有反代，绝不发往公共镜像
+github_api_get() {
+	local api_url="$1"
+	local nocache="${2:-0}"
+
+	# 会话级缓存 (TTL 300s)
+	local cache_key cache_file now mtime
+	cache_key=$(printf '%s' "$api_url" | tr -c 'a-zA-Z0-9._-' '_')
+	cache_file="/tmp/tcpx_api_cache_${cache_key:0:120}.json"
+	if [[ "$nocache" != "1" && -s "$cache_file" && ! -L "$cache_file" ]]; then
+		now=$(date +%s 2>/dev/null || echo 0)
+		mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+		if [[ $((now - mtime)) -lt 300 ]]; then
+			cat "$cache_file"
+			return 0
+		fi
+	fi
+
+	local candidates=() seen_prefixes=() p
+	_add_api_cand() {
+		local priv="$1" pref="$2" ex
+		for ex in "${seen_prefixes[@]}"; do
+			[[ "$ex" == "$pref" ]] && return 0
+		done
+		seen_prefixes+=("$pref")
+		candidates+=("${priv}|${pref}")
+	}
+
+	local tmp_resp
+	tmp_resp=$(mktemp /tmp/tcpx_api.XXXXXX) || {
+		unset -f _add_api_cand 2>/dev/null
+		return 1
+	}
+	trap 'rm -f "$tmp_resp"; unset -f _add_api_cand 2>/dev/null; trap - RETURN' RETURN
+
+	if [[ $IS_CN -eq 0 && -z "$TCPX_API_MIRROR" && -z "$TCPX_UNIVERSAL_PROXY" ]]; then
+		_add_api_cand 1 ""
+		for p in "${GH_API_MIRRORS[@]}"; do
+			_add_api_cand 0 "$p"
+		done
+	else
+		[[ -n "$TCPX_API_MIRROR" ]] && _add_api_cand 1 "$TCPX_API_MIRROR"
+		[[ -n "$TCPX_UNIVERSAL_PROXY" ]] && _add_api_cand 1 "$TCPX_UNIVERSAL_PROXY"
+		[[ -n "$BEST_API_MIRROR" && "$BEST_API_MIRROR" != "poll" ]] && _add_api_cand 0 "$BEST_API_MIRROR"
+		for p in "${GH_API_MIRRORS[@]}"; do
+			_add_api_cand 0 "$p"
+		done
+		_add_api_cand 1 ""
+	fi
+
+	local curl_base=() curl_arg
+	while IFS= read -r curl_arg; do
+		[[ -n "$curl_arg" ]] && curl_base+=("$curl_arg")
+	done < <(curl_secure_args)
+
+	local entry is_priv prefix target_url http_code mode label
+	for entry in "${candidates[@]}"; do
+		is_priv="${entry%%|*}"
+		prefix="${entry#*|}"
+		label="${prefix:-api.github.com (直连)}"
+
+		for mode in 1 0; do
+			[[ -z "$prefix" && "$mode" == "0" ]] && break
+			target_url=$(build_mirror_url "$prefix" "$api_url" "$mode")
+
+			local req_args=("${curl_base[@]}" --connect-timeout 8 --max-time 20
+				-H "User-Agent: tcpx-cn-accel/2.0"
+				-H "Accept: application/vnd.github+json")
+			if [[ "$is_priv" == "1" && -n "${TCPX_GITHUB_TOKEN:-}" ]]; then
+				req_args+=(-H "Authorization: Bearer ${TCPX_GITHUB_TOKEN}")
+			fi
+
+			http_code=$(curl "${req_args[@]}" -o "$tmp_resp" -w '%{http_code}' "$target_url" 2>/dev/null) || http_code="${http_code:-000}"
+
+			if [[ "$http_code" == "200" && -s "$tmp_resp" ]] &&
+				! is_html_file "$tmp_resp" &&
+				head -c 64 "$tmp_resp" 2>/dev/null | grep -qE '^[[:space:]]*[\[\{]'; then
+				if grep -qiE 'API rate limit exceeded|secondary rate limit' "$tmp_resp" 2>/dev/null; then
+					echo -e "${TIP} API 节点 ${label} 触发频率限制，自动切换下一节点..." >&2
+					break
+				fi
+				cp -f "$tmp_resp" "$cache_file" 2>/dev/null && chmod 600 "$cache_file" 2>/dev/null || true
+				cat "$tmp_resp"
+				return 0
+			fi
+
+			if [[ "$http_code" == "403" ]] && grep -qiE 'rate limit' "$tmp_resp" 2>/dev/null; then
+				echo -e "${TIP} API 节点 ${label} 触发 GitHub API 频率限制 (403)，自动切换下一节点..." >&2
+				break
+			fi
+
+			[[ -z "$http_code" || "$http_code" == "000" ]] && break
+		done
+	done
+
+	echo -e "${ERROR} 所有 GitHub API 节点均请求失败或触发限速！可在菜单 [70] 配置自建反代或 GitHub Token。" >&2
 	return 1
 }
 
 # 4. 从候选链接中挑出版本号最高的一条 (get_github_asset 的收尾步骤)
-# GitHub 的 /releases 接口是按 created_at 倒序返回的，不是按版本号倒序，两者并不等价：
-#   - 同一仓库中多个 release 的 created 时间可能完全相同 —— ylx2016/kernel 的所有
-#     *Kernel_Cloud* tag 都是 2026-09-03T10:37:26Z (只有更新的 assets 才会动 updated_at)。
-#     此时接口返回顺序对该仓库而言是任意的：实测 7.2.9 排在 7.2.10 / 7.2.11 之前。
-#   - 因此取 head -n 1 得到的既不是"最新发布"也不是"最高版本"，而是列表里恰好靠前的
-#     那一条 —— 菜单 1「安装最新自编译内核」装出 7.2.9 就是这么来的。
-# 故此处改为按文件名里的版本号排序取最大值，与接口返回顺序彻底解耦。
 pick_latest_asset() {
-	# stdin: 每行一个候选 URL；stdout: 版本号最高的一条 (无法比较版本时才退回第一条)
 	local url base ver
 	local unversioned=""
 	local versioned=()
 	while IFS= read -r url; do
 		[[ -z "$url" ]] && continue
 		base="${url##*/}"
-		# 文件名中第一个 N.N.N 即内核版本，形如:
-		#   linux-image-7.2.11_7.2.11-2_amd64.deb
-		#   CentOS-7_Required_kernel-6.7.9-bbrplus.el7.x86_64.rpm
-		# 这与下方安装时用来展示版本号的正则完全一致，保证"显示的"就是"选中的"。
-		# 注意不能取文件名中最大的数字段: el7.x86_64 里的 86 会盖过 6.7.9。
 		ver=$(printf '%s\n' "$base" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-		# 若文件名本身不带版本号 (如 tcp-brutal.dkms.tar.gz)，回退提取路径中的 /vX.Y.Z/ tag 版本
-		if [[ -z "$ver" ]]; then
-			ver=$(printf '%s\n' "$url" | grep -oE '/v[0-9]+\.[0-9]+\.[0-9]+/' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-		fi
 		if [[ -z "$ver" ]]; then
 			[[ -z "$unversioned" ]] && unversioned="$url"
 			continue
@@ -542,65 +1335,464 @@ pick_latest_asset() {
 		printf '%s\n' "$unversioned"
 		return 0
 	fi
-	# 按第 1 字段(版本号)做版本序排序后取末行；URL 中不含空格，按首个空格切回原文无误。
 	printf '%s\n' "${versioned[@]}" | sort -V -k1,1 | tail -n 1 | sed 's/^[^ ]* //'
 }
 
-# 3. 稳健的 GitHub 资源获取函数 (通过 API 加速镜像池获取 JSON，再通过 grep 多重过滤)
+# 从同一 GitHub asset 对象中精确关联 URL 与 SHA-256（支持 jq -> python3 -> 优雅降级）
+asset_digest_for_url() {
+	local response="$1"
+	local url="$2"
+	local digest=""
+
+	if command -v jq >/dev/null 2>&1; then
+		if ! digest=$(printf '%s' "$response" | jq -er --arg url "$url" '
+			if type != "array" then error("invalid releases response") else . end |
+			[.[] | .assets[]? | select(.browser_download_url == $url)] as $assets |
+			if ($assets | length) != 1 then error("asset URL is missing or ambiguous")
+			elif $assets[0].digest == null then ""
+			else $assets[0].digest |
+				if type != "string" then error("invalid asset digest")
+				elif test("^sha256:[0-9a-fA-F]{64}$") then ltrimstr("sha256:")
+				else error("invalid SHA-256 digest") end
+			end'); then
+			return 1
+		fi
+		printf '%s' "${digest,,}"
+		return 0
+	elif command -v python3 >/dev/null 2>&1; then
+		if ! digest=$(printf '%s' "$response" | python3 -c '
+import json, re, sys
+target = sys.argv[1]
+data = json.load(sys.stdin)
+if not isinstance(data, list):
+    sys.exit(1)
+matches = [a for r in data for a in (r.get("assets") or []) if a.get("browser_download_url") == target]
+if len(matches) != 1:
+    sys.exit(1)
+d = matches[0].get("digest")
+if d is None:
+    print("", end="")
+elif isinstance(d, str) and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", d):
+    print(d[7:].lower(), end="")
+else:
+    sys.exit(1)
+' "$url" 2>/dev/null); then
+			return 1
+		fi
+		printf '%s' "$digest"
+		return 0
+	fi
+
+	echo -e "${TIP} 未检测到 jq / python3，跳过独立摘要解析（下载将启用文件格式魔数校验）。" >&2
+	return 0
+}
+
+# 查询单个 Release Tag 下某文件的 SHA-256（供 fetch_kernel_archive 对 437MB 整包做校验）
+get_release_asset_digest() {
+	local repo="$1"
+	local tag="$2"
+	local filename="$3"
+	local api_url="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+	local response digest=""
+
+	response=$(github_api_get "$api_url" 2>/dev/null) || return 1
+	if command -v jq >/dev/null 2>&1; then
+		digest=$(printf '%s' "$response" | jq -r --arg name "$filename" '
+			(.assets // [])[] | select(.name == $name) | .digest // ""' 2>/dev/null | head -n 1)
+	elif command -v python3 >/dev/null 2>&1; then
+		digest=$(printf '%s' "$response" | python3 -c '
+import json, sys
+name = sys.argv[1]
+data = json.load(sys.stdin)
+for a in (data.get("assets") or []):
+    if a.get("name") == name and a.get("digest"):
+        print(a["digest"])
+        break
+' "$filename" 2>/dev/null)
+	fi
+	if [[ "$digest" =~ ^sha256:([0-9a-fA-F]{64})$ ]]; then
+		printf '%s' "${BASH_REMATCH[1],,}"
+		return 0
+	fi
+	return 1
+}
+
+# 5. 稳健的 GitHub 资源获取函数 (经由 github_api_get 全链路加速 + 容灾 + 缓存)
 # 用法: get_github_asset <仓库名> <Tag关键词> <文件名关键词> [架构关键词]
-# 示例: get_github_asset "ylx2016/kernel" "Debian_Kernel" "headers"
-# 多个候选命中时返回版本号最高的一个 (见 pick_latest_asset)
 get_github_asset() {
 	local repo="$1"
 	local tag_kw="$2"
 	local ast_kw="$3"
-	local arch_kw="$4" # 可选的架构关键词
-	# per_page=100: 默认只返回 30 个 release，一旦上游 tag 变多，老候选会被截断；
-	# 本脚本永远只关心"最高版本"，取满一页即可，无需翻页。
-	local api_url="${GITHUB_API_BASE}/repos/${repo}/releases?per_page=100"
+	local arch_kw="$4"
+	local api_url="https://api.github.com/repos/${repo}/releases?per_page=100"
 
 	local response
-	if ! response=$(fetch_github_api "$api_url"); then
-		echo -e "${ERROR} 无法通过加速镜像从 ${repo} 获取 API 资源列表，请检查网络或稍后再试！" >&2
+	if ! response=$(github_api_get "$api_url"); then
+		echo -e "${ERROR} GitHub API 请求失败，无法获取 ${repo} 发布列表。" >&2
 		return 1
 	fi
 
-	# 提取出该仓库所有的下载直链，并统一剥离可能附带的镜像前缀以便精准过滤。
-	local all_urls
-	all_urls=$(echo "$response" | grep -oE '"browser_download_url":[[:space:]]*"[^"]+"' | grep -oE 'https?://[^"]+' | while IFS= read -r _u; do strip_github_mirror "$_u"; done)
+	local all_urls=""
+	if command -v jq >/dev/null 2>&1; then
+		all_urls=$(printf '%s' "$response" | jq -er '
+			if type != "array" then error("invalid releases response") else . end |
+			.[] | .assets[]? | .browser_download_url |
+			select(type == "string") | select(startswith("https://"))') || return 1
+	elif command -v python3 >/dev/null 2>&1; then
+		all_urls=$(printf '%s' "$response" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if not isinstance(data, list):
+    sys.exit(1)
+for r in data:
+    for a in (r.get("assets") or []):
+        u = a.get("browser_download_url", "")
+        if isinstance(u, str) and u.startswith("https://"):
+            print(u)
+' 2>/dev/null) || return 1
+	else
+		all_urls=$(printf '%s\n' "$response" | grep -oE '"browser_download_url":[[:space:]]*"[^"]+"' | grep -oE 'https://[^"]+')
+	fi
+
 	if [[ -z "$all_urls" ]]; then
 		echo -e "${ERROR} 无法从 ${repo} 获取资源列表，请检查网络或稍后再试！" >&2
 		return 1
 	fi
 
-	# 利用 grep -iE 进行层层精准过滤
-	local result=$(echo "$all_urls" | grep -iE "$tag_kw" | grep -iE "$ast_kw")
-	[[ -n "$arch_kw" ]] && result=$(echo "$result" | grep -iE "$arch_kw")
+	local result
+	result=$(printf '%s\n' "$all_urls" | grep -iE "$tag_kw" | grep -iE "$ast_kw")
+	[[ -n "$arch_kw" ]] && result=$(printf '%s\n' "$result" | grep -iE "$arch_kw")
 
-	# 排除调试符号包与未签名包：dbg 包体积可达数百 MB 且完全不可用于安装，
-	# 而 grep "image" 会同时命中 linux-image-*-dbg_*.deb，head -n 1 有取错风险
-	result=$(echo "$result" | grep -viE 'dbg|debug|unsigned')
+	# 排除调试符号包与未签名包
+	result=$(printf '%s\n' "$result" | grep -viE 'dbg|debug|unsigned')
 
-	# 终极防呆机制：如果是 x86_64 架构，且关键词中没有声明要找 arm64，则强行排除带 arm64/aarch64 的链接，防止模糊匹配误伤
+	# 防呆：x86_64 排除 arm64/aarch64
 	if [[ "$arch_kw" != *"arm64"* && "$tag_kw" != *"arm64"* && "$OS_ARCH" != "aarch64" ]]; then
-		result=$(echo "$result" | grep -viE "arm64|aarch64")
+		result=$(printf '%s\n' "$result" | grep -viE "arm64|aarch64")
 	fi
 
-	# 候选可能有多条 (同一仓库的多个版本)，取版本号最高的那条
-	local asset_url=$(echo "$result" | pick_latest_asset)
-
+	local asset_url
+	asset_url=$(printf '%s\n' "$result" | pick_latest_asset)
 	if [[ -z "$asset_url" ]]; then
 		echo -e "${ERROR} 无法在 ${repo} 中解析到匹配关键字 (${tag_kw} -> ${ast_kw} -> ${arch_kw}) 的文件！" >&2
 		return 1
 	fi
 
-	# 直接输出拼接好加速前缀的下载地址 (后续 safe_wget 仍支持自动切换到其它备用镜像)
-	local out_prefix=""
-	if [[ $IS_CN -eq 1 ]]; then
-		out_prefix="${BEST_MIRROR:-$GH_PROXY}"
-		[[ "$out_prefix" == "poll" ]] && out_prefix="${GH_DL_MIRRORS[0]}"
+	local digest=""
+	if ! digest=$(asset_digest_for_url "$response" "$asset_url"); then
+		echo -e "${ERROR} 无法可靠关联资源与摘要，已中止。" >&2
+		return 1
 	fi
-	build_mirror_url "$out_prefix" "$asset_url"
+	printf '%s\t%s\n' "$asset_url" "$digest"
+}
+
+# 6. 获取当前生效的 GitHub 文件/API 加速前缀（供子脚本动态改写使用）
+get_active_github_mirror_prefix() {
+	if [[ $IS_CN -eq 0 && -z "$TCPX_MIRROR" && -z "$TCPX_UNIVERSAL_PROXY" ]]; then
+		return 0
+	fi
+	local p=""
+	if [[ -n "$TCPX_MIRROR" ]]; then
+		p="$TCPX_MIRROR"
+	elif [[ -n "$TCPX_UNIVERSAL_PROXY" ]]; then
+		p="$TCPX_UNIVERSAL_PROXY"
+	elif [[ -n "$BEST_MIRROR" && "$BEST_MIRROR" != "poll" ]]; then
+		p="$BEST_MIRROR"
+	else
+		p="${GH_FILE_MIRRORS[0]}"
+	fi
+	normalize_mirror_prefix "$p"
+}
+
+get_active_api_mirror_prefix() {
+	if [[ $IS_CN -eq 0 && -z "$TCPX_API_MIRROR" && -z "$TCPX_UNIVERSAL_PROXY" ]]; then
+		return 0
+	fi
+	local p=""
+	if [[ -n "$TCPX_API_MIRROR" ]]; then
+		p="$TCPX_API_MIRROR"
+	elif [[ -n "$TCPX_UNIVERSAL_PROXY" ]]; then
+		p="$TCPX_UNIVERSAL_PROXY"
+	elif [[ -n "$BEST_API_MIRROR" && "$BEST_API_MIRROR" != "poll" ]]; then
+		p="$BEST_API_MIRROR"
+	else
+		p="${GH_API_MIRRORS[0]}"
+	fi
+	normalize_mirror_prefix "$p"
+}
+
+# 7. 子脚本内部 GitHub / 海外源 URL 动态加速改写器
+#    解决“主脚本用镜像下好了子脚本，子脚本一跑又直连 GitHub 卡死”的顽疾！
+#    用法: patch_child_script_mirrors <临时脚本路径> <类型: lotserver|lotspeed|brutal|tcpfit|liquorix>
+patch_child_script_mirrors() {
+	local script_file="$1"
+	local kind="$2"
+	[[ -f "$script_file" ]] || return 0
+
+	local file_prefix api_prefix uproxy
+	file_prefix=$(get_active_github_mirror_prefix)
+	api_prefix=$(get_active_api_mirror_prefix)
+	uproxy=$(normalize_mirror_prefix "${TCPX_UNIVERSAL_PROXY:-}")
+
+	case "$kind" in
+	lotserver)
+		if [[ -n "$file_prefix" ]]; then
+			sed -i "s|https://github.com/fei5seven/lotServer/raw/master/|${file_prefix}https://github.com/fei5seven/lotServer/raw/master/|g" "$script_file"
+			echo -e "${INFO} 已为 lotServer 安装脚本注入国内加速镜像 (${file_prefix})。"
+		fi
+		;;
+	lotspeed)
+		if [[ -n "$file_prefix" ]]; then
+			sed -i "s|https://raw.githubusercontent.com/|${file_prefix}https://raw.githubusercontent.com/|g" "$script_file"
+			echo -e "${INFO} 已为 LotSpeed 安装脚本注入国内加速镜像 (${file_prefix})。"
+		fi
+		;;
+	brutal)
+		if [[ -n "$file_prefix" ]]; then
+			sed -i "s|REPO_URL=\"https://github.com/HyNetworks/tcp-brutal\"|REPO_URL=\"${file_prefix}https://github.com/HyNetworks/tcp-brutal\"|g" "$script_file"
+			echo -e "${INFO} 已为 Brutal 安装脚本注入 GitHub Release 加速镜像 (${file_prefix})。"
+		fi
+		if [[ -n "$uproxy" ]]; then
+			sed -i "s|HY2_API_BASE_URL=\"https://api.hy2.io/v1\"|HY2_API_BASE_URL=\"${uproxy}https://api.hy2.io/v1\"|g" "$script_file"
+		fi
+		;;
+	tcpfit)
+		if [[ -n "$file_prefix" ]]; then
+			sed -i "s|https://raw.githubusercontent.com/Kylin010/tcpfit/|${file_prefix}https://raw.githubusercontent.com/Kylin010/tcpfit/|g" "$script_file"
+			sed -i "s|https://github.com/Kylin010/tcpfit/releases/download/|${file_prefix}https://github.com/Kylin010/tcpfit/releases/download/|g" "$script_file"
+		fi
+		if [[ -n "$api_prefix" ]]; then
+			sed -i "s|https://api.github.com/repos/Kylin010/tcpfit/|${api_prefix}https://api.github.com/repos/Kylin010/tcpfit/|g" "$script_file"
+		fi
+		[[ -n "$file_prefix" || -n "$api_prefix" ]] && echo -e "${INFO} 已为 tcpfit 脚本注入 Raw / Release / API 国内加速镜像。"
+		;;
+	liquorix)
+		if [[ -n "$uproxy" ]]; then
+			sed -i "s|https://liquorix.net|${uproxy}https://liquorix.net|g" "$script_file"
+			echo -e "${INFO} 已为 Liquorix 源脚本注入通用反代 (${uproxy})。"
+		fi
+		;;
+	esac
+}
+
+# 8. 全链路连通性体检工具 (菜单 [70] / 命令行 tcpx accel-test 调用)
+run_accel_diagnostics() {
+	echo -e "${INFO} ========================================================="
+	echo -e "${INFO}  tcpx 全链路加速连通性体检 (Raw / Release / API / 镜像源)"
+	echo -e "${INFO} ========================================================="
+
+	local fp ap
+	fp=$(get_active_github_mirror_prefix)
+	ap=$(get_active_api_mirror_prefix)
+	ensure_debian_mirror
+	[[ "${OS_TYPE}" == "CentOS" ]] && ensure_elrepo_mirror
+
+	_diag_check() {
+		local label="$1" url="$2" expect="$3"
+		local tmp out code t ok=0
+		tmp=$(mktemp /tmp/tcpx_diag.XXXXXX) || return
+		out=$(curl -q -sL -m 6 -H "User-Agent: tcpx-cn-accel/2.0" -r 0-2048 -o "$tmp" -w "%{http_code} %{time_total}" "$url" 2>/dev/null)
+		code=${out%% *}
+		t=${out#* }
+		if [[ "$code" =~ ^(200|206)$ ]] && ! is_html_file "$tmp"; then
+			case "$expect" in
+			sh) head -n 1 "$tmp" 2>/dev/null | grep -qE '^#!' && ok=1 ;;
+			sha) head -c 128 "$tmp" 2>/dev/null | grep -qE '^[0-9a-fA-F]{64}' && ok=1 ;;
+			json) grep -qE '"tag_name"|"browser_download_url"' "$tmp" 2>/dev/null && ok=1 ;;
+			any) [[ -s "$tmp" ]] && ok=1 ;;
+			esac
+		elif [[ "$expect" == "html" && "$code" =~ ^(200|206)$ && -s "$tmp" ]]; then
+			ok=1
+		fi
+		rm -f "$tmp"
+		if [[ $ok -eq 1 ]]; then
+			printf "  [ ${GREEN_FONT_PREFIX}正常${FONT_COLOR_SUFFIX} ] %-24s (%ss, HTTP %s)\n" "$label" "$t" "$code"
+		else
+			printf "  [ ${RED_FONT_PREFIX}异常${FONT_COLOR_SUFFIX} ] %-24s (HTTP %s, %ss)\n" "$label" "${code:-000}" "${t:-timeout}"
+		fi
+	}
+	trap 'unset -f _diag_check 2>/dev/null; trap - RETURN' RETURN
+
+	_diag_check "GitHub Raw (tcpx.sh)" "$(build_mirror_url "$fp" "${GITHUB_RAW_URL}/tcpx.sh" 1)" "sh"
+	_diag_check "GitHub Release (校验文件)" "$(build_mirror_url "$fp" "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64.sha256" 1)" "sha"
+	_diag_check "GitHub API (releases)" "$(build_mirror_url "$ap" "https://api.github.com/repos/ylx2016/Linux-NetSpeed/releases/tags/kernels" 1)" "json"
+	_diag_check "jsDelivr Raw 兜底" "https://fastly.jsdelivr.net/gh/ylx2016/Linux-NetSpeed@master/tcpx.sh" "sh"
+	_diag_check "Debian Cloud 镜像池" "${BEST_DEBIAN_MIRROR}/pool/main/l/linux/" "html"
+	_diag_check "CNB 一键DD 国内源" "https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh" "sh"
+	if [[ -n "$BEST_ELREPO_MIRROR" ]]; then
+		_diag_check "ELRepo 国内镜像" "${BEST_ELREPO_MIRROR}/kernel/el9/x86_64/repodata/repomd.xml" "any"
+	else
+		_diag_check "ELRepo 清华镜像" "https://mirrors.tuna.tsinghua.edu.cn/elrepo/kernel/el9/x86_64/repodata/repomd.xml" "any"
+	fi
+	if [[ -n "$TCPX_UNIVERSAL_PROXY" ]]; then
+		_diag_check "自建全站反代 (XanMod)" "$(build_mirror_url "$TCPX_UNIVERSAL_PROXY" "https://dl.xanmod.org/archive.key" 1)" "any"
+	fi
+	echo -e "${INFO} ========================================================="
+}
+
+# 9. 菜单 [70]: 网络加速与镜像管理中心
+manage_accel_settings() {
+	while true; do
+		clear
+		local mode_desc="自动检测"
+		[[ "$TCPX_FORCE_CN" == "1" ]] && mode_desc="强制国内加速"
+		[[ "$TCPX_FORCE_CN" == "0" ]] && mode_desc="强制海外直连"
+
+		local active_file_m active_api_m
+		active_file_m=$(get_active_github_mirror_prefix)
+		active_api_m=$(get_active_api_mirror_prefix)
+
+		echo -e "${INFO} ========================================================="
+		echo -e "${INFO}  tcpx 全链路加速与镜像管理中心 (${SH_CN_MOD})"
+		echo -e "${INFO} ========================================================="
+		echo -e "  当前运行状态 : $([[ $IS_CN -ne 0 ]] && echo -e "${GREEN_FONT_PREFIX}国内全链路加速${FONT_COLOR_SUFFIX}" || echo -e "${YELLOW_FONT_PREFIX}海外直连${FONT_COLOR_SUFFIX}") (策略: ${mode_desc})"
+		echo -e "  GitHub 文件镜像: ${GREEN_FONT_PREFIX}${active_file_m:-直连}${FONT_COLOR_SUFFIX}"
+		echo -e "  GitHub API 镜像: ${GREEN_FONT_PREFIX}${active_api_m:-直连}${FONT_COLOR_SUFFIX}"
+		echo -e "  Debian 镜像源  : ${GREEN_FONT_PREFIX}${BEST_DEBIAN_MIRROR:-${TCPX_DEBIAN_MIRROR:-自动探测}}${FONT_COLOR_SUFFIX}"
+		echo -e "  ELRepo 镜像源  : ${GREEN_FONT_PREFIX}${BEST_ELREPO_MIRROR:-${TCPX_ELREPO_MIRROR:-自动探测}}${FONT_COLOR_SUFFIX}"
+		echo -e "  全站通用反代   : ${YELLOW_FONT_PREFIX}${TCPX_UNIVERSAL_PROXY:-未配置}${FONT_COLOR_SUFFIX}"
+		echo -e "  HTTP/SOCKS代理 : ${YELLOW_FONT_PREFIX}${TCPX_HTTP_PROXY:-未配置}${FONT_COLOR_SUFFIX}"
+		echo -e "  GitHub Token   : $([[ -n "$TCPX_GITHUB_TOKEN" ]] && echo -e "${GREEN_FONT_PREFIX}已配置 (仅直连/自建反代使用)${FONT_COLOR_SUFFIX}" || echo "未配置")"
+		echo -e "  严格摘要模式   : $([[ "$TCPX_STRICT_DIGEST" == "1" ]] && echo "开启 (无摘要仅直连)" || echo "关闭 (国内推荐：有摘要校验SHA256，无摘要校验魔数)")"
+		echo -e " ---------------------------------------------------------"
+		echo -e "  ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 重新测速并刷新全部最优镜像 (GitHub 文件 / API / Debian / ELRepo)"
+		echo -e "  ${GREEN_FONT_PREFIX}2.${FONT_COLOR_SUFFIX} 设置自定义 GitHub 加速镜像 (同时用于 Raw / Release / API)"
+		echo -e "  ${GREEN_FONT_PREFIX}3.${FONT_COLOR_SUFFIX} 设置自建全站通用反代 (加速 GitHub + XanMod + Liquorix + Brutal)"
+		echo -e "  ${GREEN_FONT_PREFIX}4.${FONT_COLOR_SUFFIX} 设置 HTTP / HTTPS / SOCKS5 代理 (作用于 curl / apt / yum)"
+		echo -e "  ${GREEN_FONT_PREFIX}5.${FONT_COLOR_SUFFIX} 切换网络模式 (自动检测 / 强制国内加速 / 强制海外直连)"
+		echo -e "  ${GREEN_FONT_PREFIX}6.${FONT_COLOR_SUFFIX} 设置 GitHub Token (解决 API 限速，绝不发往公共镜像)"
+		echo -e "  ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 运行全链路连通性体检"
+		echo -e "  ${GREEN_FONT_PREFIX}8.${FONT_COLOR_SUFFIX} 切换严格摘要模式 (当前: ${TCPX_STRICT_DIGEST})"
+		echo -e "  ${GREEN_FONT_PREFIX}9.${FONT_COLOR_SUFFIX} 清除自定义配置并恢复默认"
+		echo -e "  ${GREEN_FONT_PREFIX}0.${FONT_COLOR_SUFFIX} 返回主菜单"
+		echo -e " ---------------------------------------------------------"
+
+		local sub=""
+		read -rp " 请选择 [0-9]: " sub || return 0
+		case "$sub" in
+		1)
+			rm -f /tmp/tcpx_api_cache_*.json 2>/dev/null
+			BEST_DEBIAN_MIRROR=""
+			BEST_ELREPO_MIRROR=""
+			probe_github_mirrors
+			ensure_debian_mirror
+			[[ "${OS_TYPE}" == "CentOS" ]] && ensure_elrepo_mirror
+			;;
+		2)
+			local inp=""
+			echo -e "${TIP} 示例: https://gh-proxy.org/ 或 https://你的CFWorker域名/ (直接回车清除)"
+			read -rp "请输入自定义 GitHub 加速镜像前缀: " inp
+			if [[ -z "$inp" ]]; then
+				TCPX_MIRROR=""
+				TCPX_API_MIRROR=""
+				echo -e "${INFO} 已清除自定义 GitHub 镜像。"
+			elif [[ "$inp" =~ ^https://[^[:space:]]+$ ]]; then
+				TCPX_MIRROR=$(normalize_mirror_prefix "$inp")
+				TCPX_API_MIRROR="$TCPX_MIRROR"
+				echo -e "${INFO} 已设置自定义 GitHub 镜像 (文件+API): ${TCPX_MIRROR}"
+			else
+				echo -e "${ERROR} 地址无效，必须以 https:// 开头。"
+			fi
+			save_accel_config
+			;;
+		3)
+			local inp=""
+			echo -e "${TIP} 配合配套 proxy/cf-worker.js 或 proxy/nginx-tcpx-proxy.conf 使用"
+			echo -e "${TIP} 示例: https://proxy.example.com/ 或 https://proxy.example.com/k/密钥/ (回车清除)"
+			read -rp "请输入全站通用反代前缀: " inp
+			if [[ -z "$inp" ]]; then
+				TCPX_UNIVERSAL_PROXY=""
+				echo -e "${INFO} 已清除全站通用反代。"
+			elif [[ "$inp" =~ ^https://[^[:space:]]+$ ]]; then
+				TCPX_UNIVERSAL_PROXY=$(normalize_mirror_prefix "$inp")
+				echo -e "${INFO} 已设置全站通用反代: ${TCPX_UNIVERSAL_PROXY}"
+			else
+				echo -e "${ERROR} 地址无效，必须以 https:// 开头。"
+			fi
+			save_accel_config
+			;;
+		4)
+			local inp=""
+			echo -e "${TIP} 示例: http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080 (回车清除)"
+			read -rp "请输入代理地址: " inp
+			if [[ -z "$inp" ]]; then
+				TCPX_HTTP_PROXY=""
+				unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+				echo -e "${INFO} 已清除代理配置。"
+			elif [[ "$inp" =~ ^(http|https|socks5|socks5h)://[^[:space:]]+$ ]]; then
+				TCPX_HTTP_PROXY="$inp"
+				apply_http_proxy_env
+				echo -e "${INFO} 已启用代理: ${TCPX_HTTP_PROXY}"
+			else
+				echo -e "${ERROR} 代理格式无效 (支持 http://, https://, socks5://, socks5h://)。"
+			fi
+			save_accel_config
+			;;
+		5)
+			local m_sel=""
+			echo -e "  1) 自动检测 (auto)"
+			echo -e "  2) 强制国内全链路加速 (1)"
+			echo -e "  3) 强制海外直连 (0)"
+			read -rp "请选择模式 [1-3]: " m_sel
+			case "$m_sel" in
+			1) TCPX_FORCE_CN="auto" ;;
+			2) TCPX_FORCE_CN="1"; IS_CN=1 ;;
+			3) TCPX_FORCE_CN="0"; IS_CN=0 ;;
+			*) echo -e "${TIP} 未更改。" ;;
+			esac
+			save_accel_config
+			check_cn_status
+			;;
+		6)
+			local inp=""
+			echo -e "${TIP} 安全说明：Token 仅用于直连 api.github.com 或你自建的私有反代，绝不会发送给任何公共镜像。"
+			read -rp "请输入 GitHub PAT Token (直接回车清除): " inp
+			TCPX_GITHUB_TOKEN="$inp"
+			save_accel_config
+			echo -e "${INFO} GitHub Token 配置已保存 (权限 600)。"
+			;;
+		7)
+			run_accel_diagnostics
+			;;
+		8)
+			if [[ "$TCPX_STRICT_DIGEST" == "1" ]]; then
+				TCPX_STRICT_DIGEST="0"
+				echo -e "${INFO} 已关闭严格摘要模式 (国内推荐：有摘要验 SHA-256，无摘要验文件魔数)。"
+			else
+				TCPX_STRICT_DIGEST="1"
+				echo -e "${TIP} 已开启严格摘要模式 (上游无 SHA-256 的文件将仅直连 GitHub)。"
+			fi
+			save_accel_config
+			;;
+		9)
+			rm -f "$ACCEL_CONF_FILE" /tmp/tcpx_api_cache_*.json
+			TCPX_FORCE_CN="auto"
+			TCPX_MIRROR=""
+			TCPX_API_MIRROR=""
+			TCPX_RAW_MIRROR=""
+			TCPX_UNIVERSAL_PROXY=""
+			TCPX_HTTP_PROXY=""
+			TCPX_DEBIAN_MIRROR=""
+			TCPX_ELREPO_MIRROR=""
+			TCPX_STRICT_DIGEST="0"
+			TCPX_GITHUB_TOKEN=""
+			TCPX_UPDATE_URL=""
+			BEST_DEBIAN_MIRROR=""
+			BEST_ELREPO_MIRROR=""
+			unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+			echo -e "${INFO} 已恢复全部默认配置，正在重新探测网络..."
+			check_cn_status
+			;;
+		0)
+			return 0
+			;;
+		*)
+			echo -e "${ERROR} 无效选项。"
+			;;
+		esac
+		echo ""
+		read -rp "按回车继续..." _ || return 0
+	done
 }
 
 # =================================================
@@ -627,6 +1819,8 @@ install_kernel_generic() {
 	local head_url="$2"
 	local img_url="$3"
 	local kernel_version="$4" # 新增参数，用于 UI 显示
+	local head_sha256="${5:-}" # 可选: Headers 包摘要，来自受 TLS 保护的发布元数据
+	local img_sha256="${6:-}"  # 可选: 内核包摘要；为空表示该源不提供摘要，此时仅依赖 TLS
 
 	echo -e "${INFO} ================================================"
 	if [[ -n "$kernel_version" ]]; then
@@ -667,8 +1861,8 @@ install_kernel_generic() {
 		local head_file="kernel-headers.rpm"
 		local img_file="kernel-image.rpm"
 
-		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" || return 1; }
-		safe_wget "$img_url" "$img_file" || return 1
+		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" "$head_sha256" || return 1; }
+		safe_wget "$img_url" "$img_file" "$img_sha256" || return 1
 
 		# 下载全部成功后才动系统
 		remove_old_headers
@@ -691,8 +1885,8 @@ install_kernel_generic() {
 		local img_file="linux-image.deb"
 		local deb_list=()
 
-		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" || return 1; }
-		safe_wget "$img_url" "$img_file" || return 1
+		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" "$head_sha256" || return 1; }
+		safe_wget "$img_url" "$img_file" "$img_sha256" || return 1
 
 		# 下载全部成功后才动系统
 		remove_old_headers
@@ -748,7 +1942,7 @@ installbbr() {
 		arch_kw="amd64"
 		img_kw="image" # Debian dpkg 生成的包名为 linux-image 开头
 		if [[ "$OS_ARCH" == "aarch64" ]]; then
-			tag_kw="Debian_Kernel_Cloud_arm64"
+			tag_kw="Debian_Kernel_(Cloud.*arm64|[0-9.]+_latest_arm64)"
 			arch_kw="arm64"
 		fi
 	fi
@@ -756,8 +1950,14 @@ installbbr() {
 	echo -e "${INFO} 正在向 Github/ylx2016 请求最新 ${tag_kw} 内核数据..."
 
 	# 获取下载链接 (现在抓取到的绝对纯净，无需二次 grep -v)
-	head_url=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "headers" "${arch_kw}")
-	img_url=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "${img_kw}" "${arch_kw}")
+	# 返回 "URL<TAB>sha256"：摘要在下载阶段绑定镜像返回的字节
+	local head_meta img_meta head_sha="" img_sha=""
+	head_meta=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "headers" "${arch_kw}") || return 1
+	img_meta=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "${img_kw}" "${arch_kw}") || return 1
+	head_url="${head_meta%%$'	'*}"
+	img_url="${img_meta%%$'	'*}"
+	[[ "$head_meta" == *$'	'* ]] && head_sha="${head_meta#*$'	'}"
+	[[ "$img_meta" == *$'	'* ]] && img_sha="${img_meta#*$'	'}"
 
 	# 【核心修复 2】版本号仅用于界面显示：只从文件名 (${img_url##*/}) 中提取，切勿扫描整条 URL。
 	# 因为发布 tag 内含构建日期 (如 Debian_Kernel_Cloud_7.2_bbr_2026.08.18-0005)，整条 URL 的首个
@@ -772,7 +1972,7 @@ installbbr() {
 	fi
 
 	# 将解析出的版本号作为第四个参数传递给安装函数
-	install_kernel_generic "BBR Cloud 优化内核" "$head_url" "$img_url" "$kernel_version"
+	install_kernel_generic "BBR Cloud 优化内核" "$head_url" "$img_url" "$kernel_version" "$head_sha" "$img_sha"
 }
 
 # 安装 BBRplus 新版内核 (调用引擎)
@@ -797,11 +1997,16 @@ installbbrplusnew() {
 
 	echo -e "${INFO} 正在向 UJX6N/bbrplus-6.x_stable 请求数据..."
 	# 利用精准的参数向下传递
-	head_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "headers" "${arch_kw}.*${ext}")
-	img_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "${img_kw}" "${arch_kw}.*${ext}")
+	local head_meta img_meta head_sha="" img_sha=""
+	head_meta=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "headers" "${arch_kw}.*${ext}") || return 1
+	img_meta=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "${img_kw}" "${arch_kw}.*${ext}") || return 1
+	head_url="${head_meta%%$'	'*}"
+	img_url="${img_meta%%$'	'*}"
+	[[ "$head_meta" == *$'	'* ]] && head_sha="${head_meta#*$'	'}"
+	[[ "$img_meta" == *$'	'* ]] && img_sha="${img_meta#*$'	'}"
 
 	local kernel_version=$(echo "${img_url##*/}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-	install_kernel_generic "BBRplus(UJX6N)新版内核" "$head_url" "$img_url" "$kernel_version"
+	install_kernel_generic "BBRplus(UJX6N)新版内核" "$head_url" "$img_url" "$kernel_version" "$head_sha" "$img_sha"
 }
 
 # 安装 BBRplus 内核 4.14.129 (cx9208版)
@@ -811,11 +2016,11 @@ installbbrplus() {
 	local img_url=""
 
 	if [[ "${OS_TYPE}" == "CentOS" && "${OS_VERSION_ID}" == "7" ]]; then
-		head_url="${GH_PROXY}https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/centos/7/kernel-headers-4.14.129-bbrplus.rpm"
-		img_url="${GH_PROXY}https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/centos/7/kernel-4.14.129-bbrplus.rpm"
+		head_url="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/centos/7/kernel-headers-4.14.129-bbrplus.rpm"
+		img_url="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/centos/7/kernel-4.14.129-bbrplus.rpm"
 	elif [[ "${OS_TYPE}" == "Debian" && "${OS_ARCH}" == "x86_64" ]]; then
-		head_url="${GH_PROXY}https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-headers-4.14.129-bbrplus.deb"
-		img_url="${GH_PROXY}https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-image-4.14.129-bbrplus.deb"
+		head_url="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-headers-4.14.129-bbrplus.deb"
+		img_url="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-image-4.14.129-bbrplus.deb"
 	else
 		echo -e "${ERROR} BBRplus 4.14.129 仅支持 CentOS 7 或 Debian x86_64！"
 		return 1
@@ -829,7 +2034,16 @@ installbbrplus() {
 # =================================================
 # 抓取 pool 目录清单，抽出所有 headers/kbuild 的 .deb 文件名 (供 headers 解析/校验复用)
 fetch_cloud_pool_listing() {
-	curl -sL --max-time 15 "$CLOUD_HDR_POOL" | grep -oE '(linux-headers|linux-kbuild)-[^"]+\.deb'
+	ensure_debian_mirror
+	local pool_url="$CLOUD_HDR_POOL"
+	if [[ -n "$TCPX_UNIVERSAL_PROXY" ]] && ! is_cn_domestic_mirror_url "$pool_url"; then
+		pool_url=$(build_mirror_url "$TCPX_UNIVERSAL_PROXY" "$pool_url" 1)
+	fi
+	# 兼容阿里云(&#43;)与腾讯云/清华(%2b/%2B/%7e)等不同镜像站索引页的编码差异，统一归一化去重
+	curl -q -sL --max-time 15 "$pool_url" |
+		sed 's/&#43;/+/g; s/%2[bB]/+/g; s/%7[eE]/~/g' |
+		grep -oE '(linux-headers|linux-kbuild)-[^"<> /]+\.deb' |
+		sort -Vu
 }
 
 # 由 cloud image 文件名推导配套的三件 headers 包 (arch专属 + -common + kbuild) 文件名。
@@ -1091,11 +2305,19 @@ installcloud() {
 		return 1
 	fi
 
-	local img_url_base="https://deb.debian.org/debian/pool/main/l/linux-signed-${debarch}/"
-	local img_pattern='linux-image-[^" ]+cloud-'"${debarch}"'_[^" ]+_'"${debarch}"'\.deb'
+	ensure_debian_mirror
+	local img_url_base="${BEST_DEBIAN_MIRROR}/pool/main/l/linux-signed-${debarch}/"
+	local img_pattern='linux-image-[^"<> /]+cloud-'"${debarch}"'_[^"<> /]+_'"${debarch}"'\.deb'
 
-	echo -e "${INFO} 正在从 Debian 官方源获取 Cloud 内核列表..."
-	local deb_files=$(curl -sL --max-time 10 "$img_url_base" | grep -oE "$img_pattern" | sort -V | uniq)
+	echo -e "${INFO} 正在从 Debian 镜像源 (${BEST_DEBIAN_MIRROR}) 获取 Cloud 内核列表..."
+	local list_url="$img_url_base"
+	if [[ -n "$TCPX_UNIVERSAL_PROXY" ]] && ! is_cn_domestic_mirror_url "$list_url"; then
+		list_url=$(build_mirror_url "$TCPX_UNIVERSAL_PROXY" "$list_url" 1)
+	fi
+	local deb_files
+	deb_files=$(curl -q -sL --max-time 15 "$list_url" |
+		sed 's/&#43;/+/g; s/%2[bB]/+/g; s/%7[eE]/~/g' |
+		grep -oE "$img_pattern" | sort -Vu)
 	if [[ -z "$deb_files" ]]; then
 		echo -e "${ERROR} 未找到可用的 Cloud 内核版本，请检查网络！"
 		return 1
@@ -1216,16 +2438,55 @@ fetch_kernel_archive() {
 	local dest="$2"
 	local tarball="${dest}/${name}.tar.gz"
 
-	echo -e "${INFO} 正在从 Release 下载 ${name} 内核整包 (体积较大，请耐心等待)..."
-	if ! safe_wget "${KERNEL_RELEASE_BASE}/${name}.tar.gz" "$tarball"; then
+	echo -e "${INFO} 正在从 Release 下载 ${name} 内核整包 (体积较大，已自动启用国内加速节点)..."
+	local archive_sha=""
+	archive_sha=$(get_release_asset_digest "ylx2016/Linux-NetSpeed" "kernels" "${name}.tar.gz" 2>/dev/null) || archive_sha=""
+	if ! safe_wget "${KERNEL_RELEASE_BASE}/${name}.tar.gz" "$tarball" "$archive_sha"; then
 		echo -e "${ERROR} ${name} 内核整包下载失败！"
 		return 1
 	fi
-	if ! tar xzf "$tarball" -C "$dest"; then
+	# 解压前先列成员：拒绝绝对路径与 .. 片段，避免归档把文件写到工作目录之外。
+	# tar 自身的默认策略随版本不同（CentOS 6 tar 1.23 与 7 的 1.26 行为有差异），
+	# 这里显式校验，不依赖解压器的版本相关默认值。
+	local members details
+	if ! members=$(LC_ALL=C TAR_OPTIONS= tar tzPf "$tarball" 2>/dev/null) || [[ -z "$members" ]]; then
+		echo -e "${ERROR} ${name} 内核整包无法读取或不含成员。"
+		rm -f "$tarball"
+		return 1
+	fi
+	if printf '%s\n' "$members" | grep -qE '(^/)|(^|/)\.\.(/|$)'; then
+		echo -e "${ERROR} ${name} 内核整包含有越界路径成员，已拒绝解压。"
+		rm -f "$tarball"
+		return 1
+	fi
+	# 名称合法不代表链接目标合法；仓库型归档常见相对符号链接，故允许 symlink，
+	# 但解压后必须复核每个链接都仍落在目标目录内。硬链接/设备/FIFO 一律拒绝。
+	if ! details=$(LC_ALL=C TAR_OPTIONS= tar tvzPf "$tarball" 2>/dev/null) || \
+		printf '%s\n' "$details" | grep -qvE '^[-dl]'; then
+		echo -e "${ERROR} ${name} 内核整包含有硬链接或特殊成员，已拒绝解压。"
+		rm -f "$tarball"
+		return 1
+	fi
+	if ! TAR_OPTIONS= tar xzf "$tarball" -C "$dest" --no-same-owner --no-same-permissions; then
 		echo -e "${ERROR} ${name} 内核整包解压失败 (文件可能损坏或磁盘空间不足)。"
 		rm -f "$tarball"
 		return 1
 	fi
+	local dest_root="$dest" link resolved
+	[[ "$dest_root" == /* ]] || dest_root="$(pwd)/${dest}"
+	dest_root="${dest_root%/}"
+	while IFS= read -r link; do
+		[[ -n "$link" ]] || continue
+		resolved=$(readlink -m -- "$link" 2>/dev/null)
+		case "$resolved" in
+		"$dest_root"/*) ;;
+		*)
+			echo -e "${ERROR} ${name} 内核整包含有指向目标目录之外的符号链接，已中止。"
+			rm -f "$tarball"
+			return 1
+			;;
+		esac
+	done < <(find "$dest" -type l 2>/dev/null)
 	rm -f "$tarball"
 	return 0
 }
@@ -1292,11 +2553,11 @@ installlot() {
 		# Debian/Ubuntu 走老旧的 snapshot.debian.org 源
 		local base_deb="" img_deb=""
 		if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "8" ]]; then
-			base_deb="http://snapshot.debian.org/archive/debian/20120304T220938Z/pool/main/l/linux-base/linux-base_3.5_all.deb"
-			img_deb="http://snapshot.debian.org/archive/debian/20171008T163152Z/pool/main/l/linux/linux-image-3.16.0-4-amd64_3.16.43-2+deb8u5_amd64.deb"
+			base_deb="https://snapshot.debian.org/archive/debian/20120304T220938Z/pool/main/l/linux-base/linux-base_3.5_all.deb"
+			img_deb="https://snapshot.debian.org/archive/debian/20171008T163152Z/pool/main/l/linux/linux-image-3.16.0-4-amd64_3.16.43-2+deb8u5_amd64.deb"
 		elif [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "9" ]]; then
-			base_deb="http://snapshot.debian.org/archive/debian/20160917T042239Z/pool/main/l/linux-base/linux-base_4.5_all.deb"
-			img_deb="http://snapshot.debian.org/archive/debian/20171224T175424Z/pool/main/l/linux/linux-image-4.9.0-4-amd64_4.9.65-3+deb9u1_amd64.deb"
+			base_deb="https://snapshot.debian.org/archive/debian/20160917T042239Z/pool/main/l/linux-base/linux-base_4.5_all.deb"
+			img_deb="https://snapshot.debian.org/archive/debian/20171224T175424Z/pool/main/l/linux/linux-image-4.9.0-4-amd64_4.9.65-3+deb9u1_amd64.deb"
 		else
 			echo -e "${ERROR} Lotserver 不支持当前系统版本！"
 			return 1
@@ -1840,20 +3101,23 @@ remove_bbr_lotserver() {
 	systemctl disable --now lotspeed-boot.service >/dev/null 2>&1
 
 	# 修改：停用并卸载 LotSpeed 模块 (但不物理删除文件，以便随时通过菜单快速切换)
-	if command -v lotspeed >/dev/null 2>&1; then
-		lotspeed stop >/dev/null 2>&1
+	local lotspeed_bin
+	if lotspeed_bin=$(trusted_command_path lotspeed); then
+		"$lotspeed_bin" stop >/dev/null 2>&1
 		rmmod lotspeed >/dev/null 2>&1
+	elif command -v lotspeed >/dev/null 2>&1; then
+		echo -e "${TIP} LotSpeed 助手文件或父目录不可信，已跳过执行。" >&2
 	fi
 	# 如果没有 helper 脚本但也加载了模块的兜底清理
 	if lsmod | grep -q "lotspeed"; then
 		rmmod lotspeed >/dev/null 2>&1
 	fi
 
-	if [[ -e /appex/bin/lotServer.sh ]]; then
+	if is_trusted_root_file /appex/bin/lotServer.sh; then
 		local tmp_lot
 		tmp_lot=$(mktemp /tmp/lotserver.XXXXXX)
-		if fetch_remote_script "${GH_PROXY}https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" "$tmp_lot" >/dev/null 2>&1; then
-			accelerate_script_github_urls "$tmp_lot"
+		if fetch_remote_script "https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" "$tmp_lot" >/dev/null 2>&1; then
+			patch_child_script_mirrors "$tmp_lot" "lotserver" >/dev/null 2>&1
 			echo | bash "$tmp_lot" uninstall >/dev/null 2>&1
 		fi
 		rm -f "$tmp_lot"
@@ -1915,17 +3179,21 @@ startlotserver() {
 
 	local tmp_lot
 	tmp_lot=$(mktemp /tmp/lotserver.XXXXXX) || return 1
-	if ! fetch_remote_script "${GH_PROXY}https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" "$tmp_lot"; then
+	if ! fetch_remote_script "https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" "$tmp_lot"; then
 		rm -f "$tmp_lot"
 		echo -e "${ERROR} lotServer 安装脚本下载失败！"
 		return 1
 	fi
-	accelerate_script_github_urls "$tmp_lot"
+	patch_child_script_mirrors "$tmp_lot" "lotserver"
 	echo | bash "$tmp_lot" install
 	rm -f "$tmp_lot"
 
 	if [[ ! -f /appex/etc/config ]]; then
 		echo -e "${ERROR} lotServer 安装失败，未生成配置文件 /appex/etc/config！"
+		return 1
+	fi
+	if ! is_trusted_root_file /appex/bin/lotServer.sh || ! is_trusted_root_file /appex/etc/config; then
+		echo -e "${ERROR} /appex 下的助手或配置不是 root 拥有的普通文件，拒绝以 root 执行/改写。" >&2
 		return 1
 	fi
 	sed -i '/advinacc/d; /maxmode/d' /appex/etc/config
@@ -2275,37 +3543,50 @@ startbrutal() {
 		echo -e "${INFO} Headers 已匹配，开始编译 Brutal..."
 		# 统一走 fetch_remote_script: 落盘 + 校验 (非空 & 是 shell 脚本) 后再执行，
 		# 避免 curl | bash 把 404/劫持页直接喂给 bash 以 root 运行。
-		local tmp_brutal
+		local tmp_brutal brutal_ok=0
 		tmp_brutal=$(mktemp /tmp/brutal.XXXXXX) || return 1
-		if ! fetch_remote_script "https://tcp.hy2.sh/" "$tmp_brutal"; then
+		# 国内优先走 GitHub 权威源脚本 (自动走加速镜像)，避免 tcp.hy2.sh 在国内超时
+		if [[ $IS_CN -ne 0 ]]; then
+			if fetch_remote_script "https://raw.githubusercontent.com/HyNetworks/tcp-brutal/master/scripts/install_dkms.sh" "$tmp_brutal" ||
+				fetch_remote_script "https://tcp.hy2.sh/" "$tmp_brutal"; then
+				brutal_ok=1
+			fi
+		else
+			if fetch_remote_script "https://tcp.hy2.sh/" "$tmp_brutal" ||
+				fetch_remote_script "https://raw.githubusercontent.com/HyNetworks/tcp-brutal/master/scripts/install_dkms.sh" "$tmp_brutal"; then
+				brutal_ok=1
+			fi
+		fi
+		if [[ $brutal_ok -ne 1 ]]; then
 			rm -f "$tmp_brutal"
 			echo -e "${ERROR} Brutal 安装脚本下载失败！"
 			return 1
 		fi
-		accelerate_script_github_urls "$tmp_brutal"
+		patch_child_script_mirrors "$tmp_brutal" "brutal"
 
-		# 预先通过 GitHub API 加速镜像拉取 tcp-brutal DKMS 源码包并传入 -l 离线安装，
-		# 避免子脚本内部访问 api.hy2.io 或直连 GitHub 受阻导致安装失败。
-		local k_maj k_min brutal_tag_kw="v" brutal_tar_url="" tmp_brutal_tar=""
-		k_maj=$(uname -r | cut -d. -f1)
-		k_min=$(uname -r | cut -d. -f2)
-		if [[ "$k_maj" -lt 5 || ("$k_maj" -eq 5 && "$k_min" -lt 10) ]]; then
-			brutal_tag_kw="v1\.0\.3"
-		fi
-		brutal_tar_url=$(get_github_asset "HyNetworks/tcp-brutal" "$brutal_tag_kw" "tcp-brutal\.dkms\.tar\.gz" 2>/dev/null || echo "")
-		if [[ -n "$brutal_tar_url" ]]; then
-			tmp_brutal_tar=$(mktemp /tmp/brutal_dkms.XXXXXX.tar.gz)
-			if safe_wget "$brutal_tar_url" "$tmp_brutal_tar"; then
-				bash "$tmp_brutal" install -l "$tmp_brutal_tar"
-			else
-				rm -f "$tmp_brutal_tar"
-				tmp_brutal_tar=""
-				bash "$tmp_brutal"
+		# 若国内网络无法连通 api.hy2.io，则改用加速后的 GitHub API 自动解析目标版本号
+		local brutal_args=()
+		if [[ $IS_CN -ne 0 && -z "$TCPX_UNIVERSAL_PROXY" ]]; then
+			if ! curl -q -fsSL --max-time 4 "https://api.hy2.io/v1/update?cver=installscript&arch=generic&plat=linux&chan=tcp-brutal" >/dev/null 2>&1; then
+				echo -e "${TIP} 检测到 api.hy2.io 直连不可达，自动通过 GitHub API 加速镜像解析 Brutal 最新版本..."
+				local kmaj kmin brutal_ver=""
+				kmaj=$(uname -r | cut -d. -f1)
+				kmin=$(uname -r | cut -d. -f2)
+				if [[ "$kmaj" -lt 5 || ( "$kmaj" -eq 5 && "$kmin" -lt 10 ) ]]; then
+					brutal_ver="v1.0.3"
+				else
+					local b_json
+					if b_json=$(github_api_get "https://api.github.com/repos/HyNetworks/tcp-brutal/releases/latest"); then
+						brutal_ver=$(printf '%s' "$b_json" | grep -m1 -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/')
+					fi
+				fi
+				if [[ -n "$brutal_ver" ]]; then
+					echo -e "${INFO} 已解析 Brutal 目标版本: ${GREEN_FONT_PREFIX}${brutal_ver}${FONT_COLOR_SUFFIX}"
+					brutal_args=("install" "--version" "$brutal_ver")
+				fi
 			fi
-			[[ -n "$tmp_brutal_tar" ]] && rm -f "$tmp_brutal_tar"
-		else
-			bash "$tmp_brutal"
 		fi
+		bash "$tmp_brutal" "${brutal_args[@]}"
 		rm -f "$tmp_brutal"
 		if lsmod | grep -q "brutal"; then
 			echo -e "${INFO} Brutal 模块已成功加载！"
@@ -2325,8 +3606,14 @@ startbrutal() {
 # 让 99-zz-tcpx-accel.conf 里的 lotspeed 生效 (排序在 99-tcpfit.conf 之后，稳压其默认)。
 setup_lotspeed_boot_service() {
 	local lotspeed_bin sysctl_bin
-	lotspeed_bin=$(command -v lotspeed 2>/dev/null || echo "/usr/local/bin/lotspeed")
-	sysctl_bin=$(command -v sysctl 2>/dev/null || echo "/sbin/sysctl")
+	if ! lotspeed_bin=$(trusted_command_path lotspeed) || ! sysctl_bin=$(trusted_command_path sysctl); then
+		echo -e "${ERROR} LotSpeed 或 sysctl 的文件/父目录不可信，拒绝写入开机执行路径。" >&2
+		return 1
+	fi
+	if [[ -e "$LOTSPEED_BOOT_SERVICE" || -L "$LOTSPEED_BOOT_SERVICE" ]] && ! is_trusted_root_file "$LOTSPEED_BOOT_SERVICE"; then
+		echo -e "${ERROR} 现有 LotSpeed 服务文件不可信，拒绝覆盖。" >&2
+		return 1
+	fi
 	cat >"$LOTSPEED_BOOT_SERVICE" <<EOF
 [Unit]
 Description=Load LotSpeed and apply congestion control
@@ -2341,13 +3628,15 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-	systemctl daemon-reload >/dev/null 2>&1
+	[[ $? -eq 0 ]] || return 1
+	systemctl daemon-reload >/dev/null 2>&1 || return 1
 	# 只 enable 建立开机软链，不用 --now：此刻 LotSpeed 已在运行，若再触发 oneshot 里的
 	# `lotspeed start` 会因重复启动返回非零，导致误报"启用失败"。开机自启才是这里的目的。
 	if systemctl enable lotspeed-boot.service >/dev/null 2>&1; then
 		echo -e "${INFO} 已启用 LotSpeed 开机自启 (lotspeed-boot.service)，重启后仍为默认算法。"
 	else
 		echo -e "${TIP} LotSpeed 开机自启服务启用失败 (非 systemd 环境?)，重启后可能需手动 lotspeed start。"
+		return 1
 	fi
 }
 
@@ -2357,12 +3646,12 @@ install_lotspeed() {
 	# 执行官方一键安装脚本 (走 safe_wget 以便国内机可通过镜像获取)
 	local tmp_ls
 	tmp_ls=$(mktemp /tmp/lotspeed.XXXXXX) || return 1
-	if ! fetch_remote_script "${GH_PROXY}https://raw.githubusercontent.com/uk0/lotspeed/ml-tcp/install.sh" "$tmp_ls"; then
+	if ! fetch_remote_script "https://raw.githubusercontent.com/uk0/lotspeed/ml-tcp/install.sh" "$tmp_ls"; then
 		rm -f "$tmp_ls"
 		echo -e "${ERROR} LotSpeed 安装脚本下载失败！"
 		return 1
 	fi
-	accelerate_script_github_urls "$tmp_ls"
+	patch_child_script_mirrors "$tmp_ls" "lotspeed"
 	bash "$tmp_ls"
 	rm -f "$tmp_ls"
 
@@ -2374,8 +3663,8 @@ install_lotspeed() {
 		sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.d/99-sysctl.conf /etc/sysctl.conf "$TCPX_ACCEL_DROPIN" 2>/dev/null
 		echo "net.ipv4.tcp_congestion_control=lotspeed" >>"$sysctl_conf"
 		apply_sysctl >/dev/null || return 1
+		setup_lotspeed_boot_service || return 1
 		echo -e "${INFO} LotSpeed 已设置为默认拥塞控制算法！"
-		setup_lotspeed_boot_service
 		disable_tcpfit_shaper_force
 	else
 		echo -e "${ERROR} LotSpeed 模块加载失败，请检查上方编译日志（通常是因为内核 Headers 缺失或版本过低）。"
@@ -2389,10 +3678,15 @@ enable_lotspeed_standalone() {
 		sleep 3
 		return
 	fi
+	local lotspeed_bin
+	if ! lotspeed_bin=$(trusted_command_path lotspeed); then
+		echo -e "${ERROR} LotSpeed 助手文件或父目录不可信，拒绝启动。" >&2
+		return 1
+	fi
 	remove_bbr_lotserver || return 1
 	disable_tcpfit_shaper_force
 	echo -e "${INFO} 正在启动 LotSpeed 加速..."
-	lotspeed start >/dev/null 2>&1
+	"$lotspeed_bin" start >/dev/null 2>&1 || return 1
 
 	# 确保将其写死为默认启动项
 	local sysctl_conf
@@ -2404,7 +3698,7 @@ enable_lotspeed_standalone() {
 	apply_sysctl >/dev/null || return 1
 
 	# remove_bbr_lotserver 已先禁用旧的开机服务，此处按当前 LotSpeed 状态重新启用
-	setup_lotspeed_boot_service
+	setup_lotspeed_boot_service || return 1
 
 	echo -e "${INFO} LotSpeed 加速已成功切换并启用！"
 }
@@ -2413,8 +3707,64 @@ enable_lotspeed_standalone() {
 #  杂项与附加功能模块 (补齐缺失的函数)
 # =================================================
 
+# 命令必须解析为可执行的受信普通文件；返回规范绝对路径，兼容 /sbin -> /usr/sbin。
+# 固定返回路径后再使用，避免之后重新走 PATH；拒绝 systemd 的空白、% 等特殊字符。
+trusted_command_path() {
+	local path
+	path=$(type -P "$1" 2>/dev/null) || return 1
+	path=$(readlink -f -- "$path" 2>/dev/null) || return 1
+	[[ "$path" =~ ^/[a-zA-Z0-9_./+-]+$ && -x "$path" ]] || return 1
+	is_trusted_root_file "$path" || return 1
+	printf '%s\n' "$path"
+}
+
+# 该组是否存在 root 之外的成员（显式成员，或把它当作主组）。
+# Debian/Ubuntu 的 /usr/local/bin 默认是 root:staff 2775；只有确认组内没有其他可写主体时才接受。
+group_has_non_root_members() {
+	local gid="$1"
+	[[ -n "$gid" && "$gid" =~ ^[0-9]+$ ]] || return 0
+	awk -F: -v g="$gid" '$3==g { n=split($4,m,","); for (i=1;i<=n;i++) if (m[i]!="" && m[i]!="root") { found=1; exit } } END { exit !found }' \
+		/etc/group 2>/dev/null && return 0
+	awk -F: -v g="$gid" '$4==g && $1!="root" { found=1; exit } END { exit !found }' /etc/passwd 2>/dev/null && return 0
+	return 1
+}
+
+# 文件及每级父目录都必须由 UID 0 拥有，不能为符号链接。
+# 叶子不允许他人写；父目录不允许他人写，组可写时要求该组没有 root 之外的成员，
+# 这样既接受发行版默认的 root:staff 系统目录，也排除普通用户可改名替换的目录。
+is_trusted_root_file() {
+	local path="$1" metadata uid mode gid leaf=1
+	[[ "$path" == /* && -f "$path" && ! -L "$path" ]] || return 1
+	while :; do
+		[[ ! -L "$path" ]] || return 1
+		metadata=$(stat -c '%u %a %g' -- "$path" 2>/dev/null) || return 1
+		uid="${metadata%% *}"
+		mode="${metadata#* }"
+		gid="${mode#* }"
+		mode="${mode%% *}"
+		[[ "$uid" == "0" && "$mode" =~ ^[0-7]{1,4}$ ]] || return 1
+		(( (8#$mode & 8#002) == 0 )) || return 1
+		if (( (8#$mode & 8#020) != 0 )); then
+			# 组可写父目录：root 组视为受信（加入 root 组本身已需 root 授权）；
+			# 其它组要求没有 root 之外的成员，覆盖 Debian 的 root:staff 2775 系统目录。
+			if [[ "$leaf" == "1" ]]; then
+				return 1
+			fi
+			if [[ "$gid" != "0" ]] && group_has_non_root_members "$gid"; then
+				return 1
+			fi
+		fi
+		leaf=0
+		[[ "$path" == "/" ]] && break
+		path="${path%/*}"
+		[[ -n "$path" ]] || path="/"
+		[[ -d "$path" ]] || return 1
+	done
+	return 0
+}
+
 # 通用的远程脚本获取器: 下载到临时文件 -> 校验 -> 交给调用方处理
-# 统一走 safe_wget，国内机才能借助镜像拿到 raw.githubusercontent.com 上的内容
+# 统一走 safe_wget；脚本没有独立摘要时必须直连上游 HTTPS，不经第三方镜像。
 fetch_remote_script() {
 	local url="$1"
 	local dest="$2"
@@ -2478,25 +3828,58 @@ install_self() {
 }
 
 Update_Shell() {
-	echo -e "${TIP} 注意：从上游官方仓库更新可能会覆盖当前版本的国内全链路加速补丁。"
-	local _up_ans
-	read -rp "是否仍要从官方上游拉取更新？[y/N]: " _up_ans
-	if [[ ! "$_up_ans" =~ ^[yY]$ ]]; then
-		echo -e "${INFO} 已取消更新，保留当前国内加速版。"
-		return 0
+	local update_url="${TCPX_UPDATE_URL:-}"
+	if [[ -z "$update_url" ]]; then
+		echo -e "${INFO} 当前运行版本: v${SH_VER} (${SH_CN_MOD})"
+		echo -e "${TIP} 注意：上游原版 (${GITHUB_RAW_URL}/tcpx.sh) 不包含本版的全链路国内加速引擎。"
+		echo -e "  ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 仅检查上游最新版本号 (不覆盖当前加速版)"
+		echo -e "  ${GREEN_FONT_PREFIX}2.${FONT_COLOR_SUFFIX} 从自定义镜像/仓库 URL 更新 (可指向你自己托管的加速版)"
+		echo -e "  ${GREEN_FONT_PREFIX}3.${FONT_COLOR_SUFFIX} 强制覆盖为上游原版 tcpx.sh (通过加速镜像下载)"
+		echo -e "  ${GREEN_FONT_PREFIX}0.${FONT_COLOR_SUFFIX} 取消返回"
+		local up_choice=""
+		read -rp "请选择 [0-3]: " up_choice || return 0
+		case "$up_choice" in
+		1)
+			local chk_tmp
+			chk_tmp=$(mktemp /tmp/tcpx_verchk.XXXXXX) || return 1
+			if fetch_remote_script "${GITHUB_RAW_URL}/tcpx.sh" "$chk_tmp"; then
+				local remote_ver
+				remote_ver=$(grep -m1 -oE 'SH_VER="[^"]+"' "$chk_tmp" | cut -d'"' -f2)
+				echo -e "${INFO} 本地版本: v${SH_VER} | 上游 GitHub 最新版本: v${remote_ver:-未知}"
+			else
+				echo -e "${ERROR} 无法连接上游检查版本。"
+			fi
+			rm -f "$chk_tmp"
+			return 0
+			;;
+		2)
+			read -rp "请输入自定义 tcpx.sh 更新地址 (https://...): " update_url
+			if [[ ! "$update_url" =~ ^https://[^[:space:]]+$ ]]; then
+				echo -e "${ERROR} 地址无效，已取消。"
+				return 1
+			fi
+			TCPX_UPDATE_URL="$update_url"
+			save_accel_config
+			;;
+		3)
+			update_url="${GITHUB_RAW_URL}/tcpx.sh"
+			;;
+		*)
+			echo -e "${INFO} 已取消更新。"
+			return 0
+			;;
+		esac
 	fi
-	echo -e "${INFO} 正在更新脚本..."
 
-	# 关键: 绝不能直接 wget -O 覆盖正在运行的脚本文件。
-	# bash 是边读边执行的，覆写自身会导致后续语句从错误的字节偏移继续解析。
-	# 正确做法是先下到临时文件、校验通过后再 mv 覆盖，最后 exec 重启。
+	echo -e "${INFO} 正在从 ${update_url} 拉取更新..."
+
 	local tmp_sh
 	tmp_sh=$(mktemp /tmp/tcpx_update.XXXXXX) || {
 		echo -e "${ERROR} 无法创建临时文件！"
 		return 1
 	}
 
-	if ! fetch_remote_script "${GITHUB_RAW_URL}/tcpx.sh" "$tmp_sh"; then
+	if ! fetch_remote_script "$update_url" "$tmp_sh"; then
 		rm -f "$tmp_sh"
 		echo -e "${ERROR} 脚本更新失败，已保留当前版本 (未做任何更改)。"
 		return 1
@@ -2608,13 +3991,22 @@ uninstall_tcpx() {
 }
 
 gotodd() {
-	echo -e "${INFO} 正在切换到一键 DD 系统脚本..."
-	local tmp_sh
+	echo -e "${INFO} 正在切换到一键 DD 系统脚本 (reinstall.sh)..."
+	local tmp_sh dd_ok=0
 	tmp_sh=$(mktemp /tmp/reinstall.XXXXXX) || return 1
 
-	# 优先使用 bin456789 官方维护的国内 cnb.cool 镜像源，失败时回退到 GitHub 加速镜像池
-	if ! fetch_remote_script "https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh" "$tmp_sh" &&
-		! fetch_remote_script "${GH_PROXY}https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" "$tmp_sh"; then
+	if [[ $IS_CN -ne 0 ]]; then
+		echo -e "${INFO} 国内环境优先使用 reinstall 官方 CNB 国内高速镜像..."
+		if fetch_remote_script "https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh" "$tmp_sh" ||
+			fetch_remote_script "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" "$tmp_sh"; then
+			dd_ok=1
+		fi
+	else
+		if fetch_remote_script "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" "$tmp_sh"; then
+			dd_ok=1
+		fi
+	fi
+	if [[ $dd_ok -ne 1 ]]; then
 		rm -f "$tmp_sh"
 		echo -e "${ERROR} reinstall.sh 下载失败！"
 		return 1
@@ -2655,21 +4047,21 @@ EOF
 }
 
 # 调起 tcpfit 进行网络精调 (自适应 BDP/内存的独立工具)
-# 已改为通过 safe_wget 镜像轮询落盘 + 子脚本内部 GitHub 地址加速替换，彻底解决国内无法直连 raw/api/releases 的问题。
+# 按要求：菜单 [60] 直接从上游一键运行 tcpfit，不做任何检测或提示。
+# 注意: 此处走原生 curl 直连，未使用脚本内的镜像/落盘校验逻辑；
+#       国内网络若无法直连 raw.githubusercontent.com 可能失败。
 run_tcpfit_tune() {
-	echo -e "${INFO} 正在通过加速镜像调起 tcpfit 进行网络精调..."
-	local tmp_tcpfit
-	tmp_tcpfit=$(mktemp /tmp/tcpfit.XXXXXX) || return 1
-	if ! fetch_remote_script "${GH_PROXY}https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh" "$tmp_tcpfit"; then
-		rm -f "$tmp_tcpfit"
-		echo -e "${ERROR} tcpfit 脚本下载失败！"
+	echo -e "${INFO} 正在通过全链路加速通道拉取并启动 tcpfit 网络精调..."
+	local tmp_tf
+	tmp_tf=$(mktemp /tmp/tcpfit.XXXXXX) || return 1
+	if ! fetch_remote_script "https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh" "$tmp_tf"; then
+		rm -f "$tmp_tf"
+		echo -e "${ERROR} tcpfit.sh 下载失败！"
 		return 1
 	fi
-	accelerate_script_github_urls "$tmp_tcpfit"
-	bash "$tmp_tcpfit"
-	rm -f "$tmp_tcpfit"
-	# 若 tcpfit 自安装到了 /usr/local/bin/tcpfit，同步对其内部的 GitHub 更新/自检链接施加加速
-	[[ -f /usr/local/bin/tcpfit ]] && accelerate_script_github_urls /usr/local/bin/tcpfit
+	patch_child_script_mirrors "$tmp_tf" "tcpfit"
+	bash "$tmp_tf"
+	rm -f "$tmp_tf"
 }
 
 # =================================================
@@ -2697,7 +4089,7 @@ get_system_info() {
 # 绘制菜单与状态面板 (不含读取输入，便于循环复用)
 show_menu_panel() {
 	clear
-	echo && echo -e " TCP加速 一键安装管理脚本 ${RED_FONT_PREFIX}[v${SH_VER}] 不卸内核${FONT_COLOR_SUFFIX} from blog.ylx.me 母鸡慎用
+	echo && echo -e " TCP加速 一键安装管理脚本 ${RED_FONT_PREFIX}[v${SH_VER} · ${SH_CN_MOD}] 不卸内核${FONT_COLOR_SUFFIX} from blog.ylx.me 母鸡慎用
  ${GREEN_FONT_PREFIX}0.${FONT_COLOR_SUFFIX} 升级脚本                 ${GREEN_FONT_PREFIX}88.${FONT_COLOR_SUFFIX} 卸载本脚本
  ———————————————————————————— 内核安装 —————————————————————————————
  ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 安装 BBR自编编译内核     ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 安装 官方稳定内核
@@ -2721,7 +4113,8 @@ show_menu_panel() {
  ${GREEN_FONT_PREFIX}51.${FONT_COLOR_SUFFIX} 查看排序内核            ${GREEN_FONT_PREFIX}52.${FONT_COLOR_SUFFIX} 删除保留指定内核
  ${GREEN_FONT_PREFIX}55.${FONT_COLOR_SUFFIX} 卸载全部加速            ${GREEN_FONT_PREFIX}99.${FONT_COLOR_SUFFIX} 退出脚本
  ———————————————————————————— 其它工具 —————————————————————————————
- ${GREEN_FONT_PREFIX}60.${FONT_COLOR_SUFFIX} 网络精调(tcpfit联动)    ${GREEN_FONT_PREFIX}92.${FONT_COLOR_SUFFIX} 一键DD重装系统
+ ${GREEN_FONT_PREFIX}60.${FONT_COLOR_SUFFIX} 网络精调(tcpfit联动)    ${GREEN_FONT_PREFIX}70.${FONT_COLOR_SUFFIX} 网络加速与镜像管理
+ ${GREEN_FONT_PREFIX}92.${FONT_COLOR_SUFFIX} 一键DD重装系统
 ————————————————————————————————————————————————————————————————"
 	check_status
 	get_system_info
@@ -2732,6 +4125,14 @@ show_menu_panel() {
 		echo -e " 状态: ${GREEN_FONT_PREFIX}已安装${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${kernel_status}${FONT_COLOR_SUFFIX} 加速内核 , ${GREEN_FONT_PREFIX}${run_status}${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${brutal}${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${lotspeed_status}${FONT_COLOR_SUFFIX}"
 	fi
 	echo -e " 拥塞控制算法: ${GREEN_FONT_PREFIX}${net_congestion_control}${FONT_COLOR_SUFFIX} 队列算法: ${GREEN_FONT_PREFIX}${net_qdisc}${FONT_COLOR_SUFFIX} Headers状态：${GREEN_FONT_PREFIX}${headers_status}${FONT_COLOR_SUFFIX}"
+	local _disp_fm _disp_am
+	_disp_fm=$(get_active_github_mirror_prefix)
+	_disp_am=$(get_active_api_mirror_prefix)
+	if [[ $IS_CN -ne 0 || -n "$TCPX_UNIVERSAL_PROXY" || -n "$TCPX_MIRROR" ]]; then
+		echo -e " 加速通道: ${GREEN_FONT_PREFIX}已启用${FONT_COLOR_SUFFIX} | 文件: ${GREEN_FONT_PREFIX}${_disp_fm:-直连}${FONT_COLOR_SUFFIX} | API: ${GREEN_FONT_PREFIX}${_disp_am:-直连}${FONT_COLOR_SUFFIX}${TCPX_HTTP_PROXY:+ | 代理: ${YELLOW_FONT_PREFIX}${TCPX_HTTP_PROXY}${FONT_COLOR_SUFFIX}}"
+	else
+		echo -e " 加速通道: ${YELLOW_FONT_PREFIX}海外直连${FONT_COLOR_SUFFIX}${TCPX_HTTP_PROXY:+ | 代理: ${YELLOW_FONT_PREFIX}${TCPX_HTTP_PROXY}${FONT_COLOR_SUFFIX}} (菜单 [70] 可切换)"
+	fi
 	if tcpfit_present; then
 		echo -e " ${YELLOW_FONT_PREFIX}检测到 tcpfit 正在管理网络参数${FONT_COLOR_SUFFIX}: 菜单 [60] 可调起 tcpfit，[32] 会让路，切算法自动抢优先级"
 	fi
@@ -2789,6 +4190,7 @@ start_menu() {
 		52) delete_kernel_custom ;;
 		55) remove_all ;;
 		60) run_tcpfit_tune ;;
+		70) manage_accel_settings ;;
 		92) gotodd ;;
 		99)
 			echo -e "${INFO} 已退出。"
@@ -3076,22 +4478,50 @@ check_sys_official_bbr() {
 			echo -e "${ERROR} 不支持x86_64以外的系统 !"
 			return 1
 		}
-		rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
-		if [[ "${OS_VERSION_ID}" == "7" ]]; then
-			yum install https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm -y
-			yum --enablerepo=elrepo-kernel install kernel-ml kernel-ml-headers -y --skip-broken
-		elif [[ "${OS_VERSION_ID}" == "8" ]]; then
-			yum install https://www.elrepo.org/elrepo-release-8.el8.elrepo.noarch.rpm -y
-			yum --enablerepo=elrepo-kernel install kernel-ml kernel-ml-headers -y --skip-broken
-		elif [[ "${OS_VERSION_ID}" == "9" ]]; then
-			yum install https://www.elrepo.org/elrepo-release-9.el9.elrepo.noarch.rpm -y
-			yum --enablerepo=elrepo-kernel install kernel-ml kernel-ml-headers -y --skip-broken
-		elif [[ "${OS_VERSION_ID}" == "10" ]]; then
-			yum install https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm -y
-			yum --enablerepo=elrepo-kernel install kernel-ml kernel-ml-headers -y --skip-broken
-		else
+		if [[ ! "${OS_VERSION_ID}" =~ ^(7|8|9|10)$ ]]; then
 			echo -e "${ERROR} 不支持当前系统 CentOS ${OS_VERSION_ID} !" && return 1
 		fi
+		ensure_elrepo_mirror
+		local elrepo_installed=0
+		if [[ -n "$BEST_ELREPO_MIRROR" ]]; then
+			echo -e "${INFO} 正在从国内 ELRepo 镜像 (${BEST_ELREPO_MIRROR}) 安装 elrepo-release..."
+			local rpms_dir="${BEST_ELREPO_MIRROR}/elrepo/el${OS_VERSION_ID}/x86_64/RPMS/"
+			local rel_rpm
+			rel_rpm=$(curl -q -fsSL --max-time 12 "$rpms_dir" |
+				grep -oE "elrepo-release-[^\"<> /]+\.el${OS_VERSION_ID}\.elrepo\.noarch\.rpm" |
+				sort -Vu | tail -n 1)
+			if [[ -n "$rel_rpm" ]]; then
+				local tmp_elr_rpm
+				tmp_elr_rpm=$(mktemp /tmp/elrepo_release.XXXXXX.rpm)
+				if safe_wget "${rpms_dir}${rel_rpm}" "$tmp_elr_rpm"; then
+					# 安装 release 包（包内自带 /etc/pki/rpm-gpg/RPM-GPG-KEY-elrepo.org，随后内核安装开启完整 GPG 校验）
+					if yum install -y --nogpgcheck "$tmp_elr_rpm"; then
+						elrepo_installed=1
+					fi
+				fi
+				rm -f "$tmp_elr_rpm"
+			fi
+		fi
+		if [[ $elrepo_installed -ne 1 ]]; then
+			local gpg_url="https://www.elrepo.org/RPM-GPG-KEY-elrepo.org"
+			local rel_url="https://www.elrepo.org/elrepo-release-${OS_VERSION_ID}.el${OS_VERSION_ID}.elrepo.noarch.rpm"
+			if [[ -n "$TCPX_UNIVERSAL_PROXY" ]]; then
+				gpg_url=$(build_mirror_url "$TCPX_UNIVERSAL_PROXY" "$gpg_url" 1)
+				rel_url=$(build_mirror_url "$TCPX_UNIVERSAL_PROXY" "$rel_url" 1)
+			fi
+			rpm --import "$gpg_url"
+			yum install "$rel_url" -y
+		fi
+		# 将 elrepo.repo 全面替换为国内镜像（清华/阿里云/中科大），加速 kernel-ml 下载
+		if [[ -n "$BEST_ELREPO_MIRROR" && -f /etc/yum.repos.d/elrepo.repo ]]; then
+			[[ ! -f /etc/yum.repos.d/elrepo.repo.bak ]] && cp -p /etc/yum.repos.d/elrepo.repo /etc/yum.repos.d/elrepo.repo.bak
+			sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/elrepo.repo
+			sed -i -E "s|^#?baseurl=https?://elrepo\.org/linux|baseurl=${BEST_ELREPO_MIRROR}|g" /etc/yum.repos.d/elrepo.repo
+			# 注释掉其余海外备用 mirror 行，避免 yum 慢回退到海外站点
+			sed -i -E 's|^[[:space:]]+https?://(mirrors\.coreix\.net|mirror\.rackspace\.com|repos\.lax-noc\.com|elrepo\.org)/|#&|g' /etc/yum.repos.d/elrepo.repo
+			echo -e "${INFO} 已将 /etc/yum.repos.d/elrepo.repo 切换至国内高速镜像: ${BEST_ELREPO_MIRROR}"
+		fi
+		yum --enablerepo=elrepo-kernel install kernel-ml kernel-ml-headers -y --skip-broken
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		apt update
 		if [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "pop" || "${OS_ID_LIKE}" == *"ubuntu"* ]]; then
@@ -3116,7 +4546,9 @@ check_sys_official_bbr() {
 					echo -e "${ERROR} 无法获取 Debian 代号"
 					return 1
 				}
-				echo "deb http://deb.debian.org/debian ${codename}-backports main" >/etc/apt/sources.list.d/${codename}-backports.list
+				ensure_debian_mirror
+				echo "deb ${BEST_DEBIAN_MIRROR} ${codename}-backports main" >/etc/apt/sources.list.d/${codename}-backports.list
+				echo -e "${INFO} 已添加 Backports 源: ${BEST_DEBIAN_MIRROR} (${codename}-backports)"
 				apt update
 				apt_args="-t ${codename}-backports"
 			else
@@ -3156,45 +4588,74 @@ install_xanmod_generic() {
 	rm -f /etc/apt/sources.list.d/xanmod-kernel.sources
 	sed -i '/deb.xanmod.org/d' /etc/apt/sources.list 2>/dev/null
 
-	# 使用现代化的 signed-by 格式写入 GPG 密钥与源，彻底消除 apt 警告
-	wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/xanmod-archive-keyring.gpg
-	echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
+	local _apt_proxy=() _parg
+	while IFS= read -r _parg; do
+		[[ -n "$_parg" ]] && _apt_proxy+=("$_parg")
+	done < <(apt_proxy_opts)
 
-	# 在临时目录下载并运行 CPU 支持等级检测脚本，避免污染调用方 CWD
-	local xanmod_work
-	xanmod_work=$(mktemp -d /tmp/xanmod_install.XXXXXX) || {
-		echo -e "${ERROR} 无法创建临时目录！"
-		return 1
-	}
-	trap 'cd /tmp; rm -rf "$xanmod_work"; trap - RETURN' RETURN
-	cd "$xanmod_work" || {
-		echo -e "${ERROR} 无法进入临时目录！"
-		return 1
-	}
-
-	local cpu_level="1"
-	if wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null &&
-		[[ -s check_x86-64_psabi.sh ]]; then
-		chmod +x check_x86-64_psabi.sh
-		# 输出示例 "Your CPU supports x86-64-v3"；提取最后出现的 v1-v4 数字
-		cpu_level=$(./check_x86-64_psabi.sh 2>/dev/null |
-			grep -oE '\bv[1-4]\b' | tail -n 1 | tr -d 'v')
-		[[ -z "$cpu_level" ]] && cpu_level="1"
-	else
-		echo -e "${TIP} CPU 等级检测脚本下载失败，将使用 v1 (最兼容) 版本。"
+	if [[ $IS_CN -ne 0 && -z "$TCPX_UNIVERSAL_PROXY" && -z "$TCPX_HTTP_PROXY" ]]; then
+		echo -e "${TIP} 提示：XanMod 官方源位于海外且国内无公共镜像；如遇下载缓慢，可在菜单 [70] 配置全站反代或 HTTP/SOCKS 代理。"
 	fi
-	echo -e "${INFO} CPU 支持等级: \033[32mv${cpu_level}\033[0m"
 
-	apt update
+	# 使用现代化的 signed-by 格式写入 GPG 密钥与源（经由 safe_wget 支持全站反代/代理）
+	local tmp_xan_key
+	tmp_xan_key=$(mktemp /tmp/xanmod_gpg.XXXXXX) || return 1
+	if ! safe_wget "https://dl.xanmod.org/archive.key" "$tmp_xan_key" &&
+		! safe_wget "https://dl.xanmod.org/gpg.key" "$tmp_xan_key"; then
+		rm -f "$tmp_xan_key"
+		echo -e "${ERROR} XanMod GPG 密钥下载失败！"
+		return 1
+	fi
+	gpg --dearmor --yes -o /usr/share/keyrings/xanmod-archive-keyring.gpg <"$tmp_xan_key"
+	rm -f "$tmp_xan_key"
+
+	local xanmod_repo_url="https://deb.xanmod.org"
+	if [[ -n "$TCPX_UNIVERSAL_PROXY" ]]; then
+		xanmod_repo_url="${TCPX_UNIVERSAL_PROXY}https://deb.xanmod.org"
+		echo -e "${INFO} 已通过全站反代加速 XanMod APT 源: ${xanmod_repo_url}"
+	fi
+	# 适配 XanMod 新版按发行版代号分仓 (bookworm/trixie/noble 等)，若无则回退 bookworm/releases
+	local xan_codename xan_suite="" cand_suite probe_code
+	xan_codename=$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null)
+	for cand_suite in ${xan_codename:+"$xan_codename"} bookworm releases; do
+		probe_code=$(curl -q -sL -m 5 -r 0-64 -o /dev/null -w '%{http_code}' "${xanmod_repo_url}/dists/${cand_suite}/InRelease" 2>/dev/null)
+		if [[ "$probe_code" =~ ^(200|206)$ ]]; then
+			xan_suite="$cand_suite"
+			break
+		fi
+	done
+	[[ -z "$xan_suite" ]] && xan_suite="${xan_codename:-releases}"
+	echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] ${xanmod_repo_url} ${xan_suite} main" | tee /etc/apt/sources.list.d/xanmod-kernel.list
+
+	# 本地原生检测 CPU x86-64 psABI 等级 (等价于 XanMod 官方 check_x86-64_psabi.sh，零联网耗时)
+	local cpu_level
+	cpu_level=$(awk '
+		BEGIN {
+			level = 1
+			while ((getline < "/proc/cpuinfo") > 0) {
+				if (/^flags[[:space:]]*:/) {
+					if (/lm/ && /cmov/ && /cx8/ && /fpu/ && /fxsr/ && /mmx/ && /syscall/ && /sse2/) level = 1
+					if (level == 1 && /cx16/ && /lahf/ && /popcnt/ && /sse4_1/ && /sse4_2/ && /ssse3/) level = 2
+					if (level == 2 && /avx/ && /avx2/ && /bmi1/ && /bmi2/ && /f16c/ && /fma/ && /abm/ && /movbe/ && /xsave/) level = 3
+					if (level == 3 && /avx512f/ && /avx512bw/ && /avx512cd/ && /avx512dq/ && /avx512vl/) level = 4
+					break
+				}
+			}
+			print level
+		}' 2>/dev/null)
+	[[ "$cpu_level" =~ ^[1-4]$ ]] || cpu_level="1"
+	echo -e "${INFO} CPU 支持等级 (本地检测): \033[32mv${cpu_level}\033[0m"
+
+	apt "${_apt_proxy[@]}" update
 	local pkg_name="linux-xanmod"
 	[[ "$edition" != "main" ]] && pkg_name="linux-xanmod-${edition}"
 
 	if [[ "$cpu_level" -ge 3 ]]; then
-		apt install "${pkg_name}-x64v3" -y
+		apt "${_apt_proxy[@]}" install "${pkg_name}-x64v3" -y
 	elif [[ "$cpu_level" -ge 2 ]]; then
-		apt install "${pkg_name}-x64v2" -y
+		apt "${_apt_proxy[@]}" install "${pkg_name}-x64v2" -y
 	else
-		apt install "${pkg_name}-x64v1" -y
+		apt "${_apt_proxy[@]}" install "${pkg_name}-x64v1" -y
 	fi
 
 	BBR_grub
@@ -3217,18 +4678,30 @@ check_sys_official_zen() {
 		# 落盘校验后再执行 Liquorix 加源脚本，避免 curl | bash
 		local tmp_lqx
 		tmp_lqx=$(mktemp /tmp/liquorix.XXXXXX) || return 1
+		local _apt_proxy=() _parg
+		while IFS= read -r _parg; do
+			[[ -n "$_parg" ]] && _apt_proxy+=("$_parg")
+		done < <(apt_proxy_opts)
+		if [[ $IS_CN -ne 0 && -z "$TCPX_UNIVERSAL_PROXY" && -z "$TCPX_HTTP_PROXY" ]]; then
+			echo -e "${TIP} 提示：Liquorix 源位于海外；如遇超时，可在菜单 [70] 配置全站反代或 HTTP/SOCKS 代理。"
+		fi
 		if ! fetch_remote_script "https://liquorix.net/add-liquorix-repo.sh" "$tmp_lqx"; then
 			rm -f "$tmp_lqx"
 			echo -e "${ERROR} Liquorix 源脚本下载失败！"
 			return 1
 		fi
+		patch_child_script_mirrors "$tmp_lqx" "liquorix"
 		bash "$tmp_lqx"
 		rm -f "$tmp_lqx"
-		apt-get install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
+		apt-get "${_apt_proxy[@]}" install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
 	elif [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "pop" || "${OS_ID_LIKE}" == *"ubuntu"* ]]; then
-		apt-get install software-properties-common -y
-		add-apt-repository ppa:damentz/liquorix -y && apt-get update
-		apt-get install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
+		local _apt_proxy=() _parg
+		while IFS= read -r _parg; do
+			[[ -n "$_parg" ]] && _apt_proxy+=("$_parg")
+		done < <(apt_proxy_opts)
+		apt-get "${_apt_proxy[@]}" install software-properties-common -y
+		add-apt-repository ppa:damentz/liquorix -y && apt-get "${_apt_proxy[@]}" update
+		apt-get "${_apt_proxy[@]}" install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
 	else
 		echo -e "${ERROR} Zen内核当前脚本仅支持 Debian/Ubuntu 及衍生版 !" && return 1
 	fi
@@ -3284,7 +4757,7 @@ check_status() {
 			;;
 		esac
 	elif [[ "$kernel_status" == "Lotserver" ]]; then
-		if [[ -e /appex/bin/lotServer.sh ]]; then
+		if is_trusted_root_file /appex/bin/lotServer.sh; then
 			run_status=$(bash /appex/bin/lotServer.sh status | grep "LotServer" | awk '{print $3}')
 			[[ "$run_status" == "running!" ]] && run_status="启动成功" || run_status="启动失败"
 		else
@@ -3383,6 +4856,14 @@ if [ $# -gt 0 ]; then
 		;;
 	ipv6-ra)
 		repair_ipv6_ra
+		exit $?
+		;;
+	accel-test)
+		run_accel_diagnostics
+		exit $?
+		;;
+	accel-config)
+		manage_accel_settings
 		exit $?
 		;;
 	*)
